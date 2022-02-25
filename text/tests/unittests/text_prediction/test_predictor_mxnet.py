@@ -5,9 +5,15 @@ import pandas as pd
 import pytest
 import tempfile
 
+try:
+    import mxnet
+except ImportError:
+    pytest.skip("MXNet is not installed. Skip this test.", allow_module_level=True)
+
 from autogluon.core.space import Int
 from autogluon.core.utils.loaders import load_pd
-from autogluon.text import TextPredictor, ag_text_presets
+from autogluon.text import TextPredictor
+from autogluon.text.text_prediction.legacy_presets import ag_text_presets
 from autogluon.text.text_prediction.constants import MXNET
 
 DATA_INFO = {
@@ -156,16 +162,6 @@ def test_emoji():
     assert set(predictor.class_labels) == {'grin', 'smile', 'wink'}
     assert predictor.class_labels_internal == [0, 1, 2]
     verify_predictor_save_load(predictor, df)
-
-
-def test_no_job_finished_raise():
-    train_data = load_pd.load('https://autogluon-text.s3-accelerate.amazonaws.com/'
-                              'glue/sst/train.parquet')
-    with pytest.raises(RuntimeError):
-        # Setting a very small time limits to trigger the bug
-        predictor = TextPredictor(label='label', backend=MXNET)
-        predictor.fit(train_data, hyperparameters=get_test_hyperparameters(),
-                      time_limit=1, num_gpus=1, seed=123)
 
 
 def test_mixed_column_type():

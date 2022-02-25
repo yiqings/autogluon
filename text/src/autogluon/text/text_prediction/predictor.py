@@ -1,10 +1,5 @@
 from ..automm import AutoMMPredictor
-from ..automm.constants import (
-    MODEL,
-    DATA,
-    OPTIMIZATION,
-    ENVIRONMENT,
-)
+from .presets import text_preset_to_config
 from .constants import PYTORCH, MXNET
 
 
@@ -185,11 +180,11 @@ class TextPredictor:
         presets : str, default = None
             Presets are pre-registered configurations that control training (hyperparameters and other aspects).
             It is recommended to specify presets and avoid specifying most other `fit()` arguments or model hyperparameters prior to becoming familiar with AutoGluon.
-            Print all available presets via `autogluon.text.list_presets()`.
+            Print all available presets via `autogluon.text.list_text_presets()`.
             Some notable presets include:
                 - "best_quality": produce the most accurate overall predictor (regardless of its efficiency).
-                - "medium_quality_faster_train": produce an accurate predictor but take efficiency into account (this is the default preset).
-                - "lower_quality_fast_train": produce a predict that is quick to train and make predictions with, even if its accuracy is worse.
+                - "high_quality": produce an accurate predictor but take efficiency into account (this is the default preset).
+                - "medium_quality_faster_train": produce a predict that is quick to train and make predictions with, even if its accuracy is worse.
         hyperparameters : dict, default = None
             The hyperparameters of the `fit()` function, which affect the resulting accuracy of the trained predictor.
             Experienced AutoGluon users can use this argument to specify neural network hyperparameter values/search-spaces as well as which hyperparameter-tuning strategy should be employed. See the "Text Prediction" tutorials for examples.
@@ -224,28 +219,19 @@ class TextPredictor:
         :class:`TextPredictor` object. Returns self.
         """
         if self._backend == PYTORCH:
-            config = {
-                MODEL: "fusion_mlp_text_tabular",
-                DATA: "default",
-                OPTIMIZATION: "adamw",
-                ENVIRONMENT: "default",
-            }
+            if presets is None:
+                presets = "default"
+            config, overrides = text_preset_to_config(presets)
+            if hyperparameters is not None:
+                overrides.update(hyperparameters)
             if num_gpus is not None:
-                if hyperparameters is None:
-                    hyperparameters = {}
-                if isinstance(hyperparameters, dict):
-                    hyperparameters.update({"env.num_gpus": int(num_gpus)})
-                elif isinstance(hyperparameters, str):
-                    hyperparameters += f" env.num_gpus={int(num_gpus)}"
-                else:
-                    raise ValueError(f"Unknown hyperparameters type: {type(hyperparameters)}")
-
+                overrides.update({"env.num_gpus": int(num_gpus)})
             self._predictor.fit(
                 train_data=train_data,
                 config=config,
                 tuning_data=tuning_data,
                 time_limit=time_limit,
-                hyperparameters=hyperparameters,
+                hyperparameters=overrides,
                 column_types=column_types,
                 holdout_frac=holdout_frac,
                 save_path=save_path,
