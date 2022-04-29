@@ -1173,9 +1173,6 @@ class AutoMMPredictor:
         model.load_state_dict(state_dict)
         return model
 
-<<<<<<< HEAD
-    def save(self, path: str, standalone: Optional[bool] = False,):
-=======
     @staticmethod
     def _replace_model_name_prefix(
             state_dict: dict,
@@ -1193,7 +1190,6 @@ class AutoMMPredictor:
             path: str,
             standalone: Optional[bool] = False
     ):
->>>>>>> upstream/master
         """
         Save this predictor to file in directory specified by `path`.
 
