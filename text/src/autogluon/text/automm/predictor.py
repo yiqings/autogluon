@@ -1221,7 +1221,7 @@ class AutoMMPredictor:
             model = create_and_save_model(
                 config=self._config,
                 num_classes=self._output_shape,
-                save_path=save_path,
+                save_path=path,
                 num_numerical_columns=len(self._df_preprocessor.numerical_feature_names),
                 num_categories=self._df_preprocessor.categorical_num_categories
             )
@@ -1229,7 +1229,7 @@ class AutoMMPredictor:
             for model_name in self._config.model.names:
                 if "hf_text" in model_name or model_name == "clip":
                     model_config = getattr(self._config.model, model_name)
-                    model_config.checkpoint_name = os.path.join(save_path,model_name)
+                    model_config.checkpoint_name = os.path.join(path,model_name)
                     
         with open(os.path.join(path, "df_preprocessor.pkl"), "wb") as fp:
             pickle.dump(self._df_preprocessor, fp)
