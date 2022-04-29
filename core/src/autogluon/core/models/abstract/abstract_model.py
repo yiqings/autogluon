@@ -233,9 +233,13 @@ class AbstractModel:
             # ignore_hpo=False,
             # max_early_stopping_rounds=None,
             # TODO: add option for only top-k ngrams
+            valid_raw_types=None,  # If a feature's raw type is not in this list, it is pruned.
+            valid_special_types=None,  # If a feature has a special type not in this list, it is pruned.
             ignored_type_group_special=None,  # List, drops any features in `self.feature_metadata.type_group_map_special[type]` for type in `ignored_type_group_special`. | Currently undocumented in task.
             ignored_type_group_raw=None,  # List, drops any features in `self.feature_metadata.type_group_map_raw[type]` for type in `ignored_type_group_raw`. | Currently undocumented in task.
-            get_features_kwargs=None,  # Kwargs for `autogluon.tabular.features.feature_metadata.FeatureMetadata.get_features()`. Overrides ignored_type_group_special and ignored_type_group_raw. | Currently undocumented in task.
+            # Kwargs for `autogluon.tabular.features.feature_metadata.FeatureMetadata.get_features()`.
+            #  Overrides valid_raw_types, valid_special_types, ignored_type_group_special and ignored_type_group_raw. | Currently undocumented in task.
+            get_features_kwargs=None,
             # TODO: v0.1 Document get_features_kwargs_extra in task.fit
             get_features_kwargs_extra=None,  # If not None, applies an additional feature filter to the result of get_feature_kwargs. This should be reserved for users and be None by default. | Currently undocumented in task.
             predict_1_batch_size=None,  # If not None, calculates `self.predict_1_time` at end of fit call by predicting on this many rows of data.
@@ -345,9 +349,16 @@ class AbstractModel:
         if get_features_kwargs is not None:
             valid_features = feature_metadata.get_features(**get_features_kwargs)
         else:
+            valid_raw_types = self.params_aux.get('valid_raw_types', None)
+            valid_special_types = self.params_aux.get('valid_special_types', None)
             ignored_type_group_raw = self.params_aux.get('ignored_type_group_raw', None)
             ignored_type_group_special = self.params_aux.get('ignored_type_group_special', None)
-            valid_features = feature_metadata.get_features(invalid_raw_types=ignored_type_group_raw, invalid_special_types=ignored_type_group_special)
+            valid_features = feature_metadata.get_features(
+                valid_raw_types=valid_raw_types,
+                valid_special_types=valid_special_types,
+                invalid_raw_types=ignored_type_group_raw,
+                invalid_special_types=ignored_type_group_special
+            )
         get_features_kwargs_extra = self.params_aux.get('get_features_kwargs_extra', None)
         if get_features_kwargs_extra is not None:
             valid_features_extra = feature_metadata.get_features(**get_features_kwargs_extra)
@@ -855,6 +866,18 @@ class AbstractModel:
         trained_params = self.params.copy()
         trained_params.update(self.params_trained)
         return trained_params
+
+    def convert_to_refit_full_via_copy(self):
+        """
+        Creates a new refit_full variant of the model, but instead of training it simply copies `self`.
+        This method is for compatibility with models that have not implemented refit_full support as a fallback.
+        """
+        __name = self.name
+        self.rename(self.name + REFIT_FULL_SUFFIX)
+        __path_refit = self.path
+        self.save(path=self.path, verbose=False)
+        self.rename(__name)
+        return self.load(path=__path_refit, verbose=False)
 
     def get_params(self) -> dict:
         """Get params of the model at the time of initialization"""

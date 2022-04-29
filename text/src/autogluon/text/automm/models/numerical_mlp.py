@@ -61,11 +61,18 @@ class NumericalMLP(nn.Module):
         # init weights
         self.apply(init_weights)
 
-        self.numerical_key = f"{prefix}_{NUMERICAL}"
-        self.label_key = f"{prefix}_{LABEL}"
+        self.prefix = prefix
 
         self.name_to_id = self.get_layer_ids()
         self.head_layer_names = [n for n, layer_id in self.name_to_id.items() if layer_id == 0]
+
+    @property
+    def numerical_key(self):
+        return f"{self.prefix}_{NUMERICAL}"
+
+    @property
+    def label_key(self):
+        return f"{self.prefix}_{LABEL}"
 
     def forward(
             self,
@@ -87,8 +94,10 @@ class NumericalMLP(nn.Module):
         logits = self.head(features)
 
         return {
-            LOGITS: logits,
-            FEATURES: features,
+            self.prefix: {
+                LOGITS: logits,
+                FEATURES: features,
+            }
         }
 
     def get_layer_ids(self,):

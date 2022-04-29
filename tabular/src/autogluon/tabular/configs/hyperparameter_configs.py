@@ -56,8 +56,9 @@ hyperparameter_config_dict = dict(
     very_light={
         'NN_TORCH': {},
         'GBM': [
-            {},
             {'extra_trees': True, 'ag_args': {'name_suffix': 'XT'}},
+            {},
+            'GBMLarge',
         ],
         'CAT': {},
         'XGB': {},
@@ -81,7 +82,7 @@ hyperparameter_config_dict = dict(
         'CAT': {},
         'XGB': {},
         # 'FASTAI': {},  # FastAI gets killed if the dataset is large (400K rows).
-        'AG_TEXT_NN': ['medium_quality_faster_train'],  # TODO, Support changing the config w.r.t the preset option.
+        'AG_TEXT_NN': {'presets': 'medium_quality_faster_train'},  # TODO, Support changing the config w.r.t the preset option.
         'AG_IMAGE_NN': {},  # TODO, Support changing the config w.r.t the preset option.
         'VW': {},
     },

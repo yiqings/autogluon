@@ -1,6 +1,12 @@
+import logging
 import torch
 import pandas as pd
+from typing import List
 from .preprocess_dataframe import MultiModalFeaturePreprocessor
+from ..constants import (
+    GET_ITEM_ERROR_RETRY, AUTOMM
+)
+logger = logging.getLogger(AUTOMM)
 
 
 class BaseDataset(torch.utils.data.Dataset):
@@ -14,8 +20,8 @@ class BaseDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         data: pd.DataFrame,
-        preprocessor: MultiModalFeaturePreprocessor,
-        processors: dict,
+        preprocessor: List[MultiModalFeaturePreprocessor],
+        processors: List[dict],
         is_training: bool = False,
     ):
         """
@@ -24,7 +30,7 @@ class BaseDataset(torch.utils.data.Dataset):
         data
             A pd.DataFrame containing multimodal features.
         preprocessor
-            A multimodal feature preprocessor generating model-agnostic features.
+            A list of multimodal feature preprocessors generating model-agnostic features.
         processors
             Data processors customizing data for each modality per model.
         is_training
@@ -35,12 +41,13 @@ class BaseDataset(torch.utils.data.Dataset):
         super().__init__()
         self.processors = processors
         self.is_training = is_training
+        self._consecutive_errors = 0
 
         self.lengths = []
-        for per_modality, per_modality_processors in processors.items():
-            if len(per_modality_processors) > 0:
-                per_modality_features = getattr(preprocessor, f"transform_{per_modality}")(data)
-                setattr(self, f"{per_modality}", per_modality_features)
+        for i, (per_preprocessor, per_processors_group) in enumerate(zip(preprocessor, processors)):
+            for per_modality in per_processors_group:
+                per_modality_features = getattr(per_preprocessor, f"transform_{per_modality}")(data)
+                setattr(self, f"{per_modality}_{i}", per_modality_features)
                 self.lengths.append(len(per_modality_features[0]))
         assert len(set(self.lengths)) == 1
 
@@ -69,8 +76,17 @@ class BaseDataset(torch.utils.data.Dataset):
         Input data formatted as a dictionary.
         """
         ret = dict()
-        for per_modality, per_modality_processors in self.processors.items():
-            for per_model_processor in per_modality_processors:
-                ret.update(per_model_processor(getattr(self, per_modality), idx, self.is_training))
-
+        try:
+            for i, per_processors_group in enumerate(self.processors):
+                for per_modality, per_modality_processors in per_processors_group.items():
+                    for per_model_processor in per_modality_processors:
+                        ret.update(per_model_processor(getattr(self, f"{per_modality}_{i}"), idx, self.is_training))
+        except Exception as e:
+            logger.debug(f"Skipping sample {idx} due to '{e}'")
+            self._consecutive_errors += 1
+            if self._consecutive_errors < GET_ITEM_ERROR_RETRY:
+                return self.__getitem__((idx + 1) % self.__len__())
+            else:
+                raise e
+        self._consecutive_errors = 0
         return ret

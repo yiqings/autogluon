@@ -24,6 +24,7 @@ class TimmAutoModelForImagePrediction(nn.Module):
             checkpoint_name: str,
             num_classes: Optional[int] = 0,
             mix_choice: Optional[str] = "all_logits",
+            pretrained: Optional[bool] = True,
     ):
         """
         Load a pretrained image backbone from TIMM.
@@ -42,11 +43,15 @@ class TimmAutoModelForImagePrediction(nn.Module):
                 The images are directly averaged and passed to the model.
             - all_logits
                 The logits output from individual images are averaged to generate the final output.
+        pretrained
+            Whether using the pretrained timm models. If pretrained=True, download the pretrained model.
         """
         super().__init__()
         # In TIMM, if num_classes==0, then create_model would automatically set self.model.head = nn.Identity()
         logger.debug(f"initializing {checkpoint_name}")
-        self.model = create_model(checkpoint_name, pretrained=True, num_classes=0)
+        self.checkpoint_name = checkpoint_name
+        self.num_classes = num_classes
+        self.model = create_model(checkpoint_name, pretrained=pretrained, num_classes=0)
         self.out_features = self.model.num_features
         self.head = nn.Linear(self.out_features, num_classes) if num_classes > 0 else nn.Identity()
         self.head.apply(init_weights)
@@ -54,12 +59,22 @@ class TimmAutoModelForImagePrediction(nn.Module):
         self.mix_choice = mix_choice
         logger.debug(f"mix_choice: {mix_choice}")
 
-        self.image_key = f"{prefix}_{IMAGE}"
-        self.image_valid_num_key = f"{prefix}_{IMAGE_VALID_NUM}"
-        self.label_key = f"{prefix}_{LABEL}"
+        self.prefix = prefix
 
         self.name_to_id = self.get_layer_ids()
         self.head_layer_names = [n for n, layer_id in self.name_to_id.items() if layer_id == 0]
+
+    @property
+    def image_key(self):
+        return f"{self.prefix}_{IMAGE}"
+
+    @property
+    def image_valid_num_key(self):
+        return f"{self.prefix}_{IMAGE_VALID_NUM}"
+
+    @property
+    def label_key(self):
+        return f"{self.prefix}_{LABEL}"
 
     def forward(
             self,
@@ -84,7 +99,7 @@ class TimmAutoModelForImagePrediction(nn.Module):
             logits = self.head(features)
 
         elif self.mix_choice == "all_logits":  # mix outputs
-            b, n, c, h, w = images.shape  # n <= max_img_num_per_col
+            b, n, c, h, w = images.shape
             features = self.model(images.reshape((b * n, c, h, w)))  # (b*n, num_features)
             logits = self.head(features)
             steps = torch.arange(0, n).type_as(image_valid_num)
@@ -98,8 +113,10 @@ class TimmAutoModelForImagePrediction(nn.Module):
             raise ValueError(f"unknown mix_choice: {self.mix_choice}")
 
         return {
-            LOGITS: logits,
-            FEATURES: features,
+            self.prefix: {
+                LOGITS: logits,
+                FEATURES: features,
+            }
         }
 
     def get_layer_ids(self,):

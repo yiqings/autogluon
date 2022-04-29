@@ -1,5 +1,9 @@
+import os
+import warnings
+
 from ..automm import AutoMMPredictor
-from .presets import text_preset_to_config
+from .presets import get_text_preset
+from ..automm.utils import parse_dotlist_conf
 from .constants import PYTORCH, MXNET
 
 
@@ -20,7 +24,7 @@ class TextPredictor:
             path=None,
             backend=PYTORCH,
             verbosity=3,
-            warn_if_exist=True
+            warn_if_exist=True,
     ):
         """
         Parameters
@@ -221,8 +225,13 @@ class TextPredictor:
         if self._backend == PYTORCH:
             if presets is None:
                 presets = "default"
-            config, overrides = text_preset_to_config(presets)
+            if self._predictor._config is None:
+                config, overrides = get_text_preset(presets)
+            else:
+                # Continue training setting
+                config, overrides = self._predictor._config, dict()
             if hyperparameters is not None:
+                hyperparameters = parse_dotlist_conf(hyperparameters)
                 overrides.update(hyperparameters)
             if num_gpus is not None:
                 overrides.update({"env.num_gpus": int(num_gpus)})
@@ -238,6 +247,8 @@ class TextPredictor:
                 seed=seed,
             )
         else:
+            warnings.warn(f'MXNet backend will be deprecated in AutoGluon 0.5. '
+                          f'You may try to switch to use backend="{PYTORCH}".', DeprecationWarning, stacklevel=1)
             self._predictor.fit(
                 train_data=train_data,
                 tuning_data=tuning_data,
@@ -347,7 +358,7 @@ class TextPredictor:
             as_pandas=as_pandas,
         )
 
-    def save(self, path):
+    def save(self, path, standalone=False):
         """
         Save this Predictor to file in directory specified by `path`.
         The relevant files will be saved in two parts:
@@ -361,11 +372,16 @@ class TextPredictor:
 
         Parameters
         ----------
-        path, str
+        path: str
             The path to directory in which to save this Predictor.
+        standalone: bool, default = False
+            Whether to save the downloaded model for offline deployment. 
+            If `standalone = True`, save the transformers.CLIPModel and transformers.AutoModel to os.path.join(path,model_name).
+            Also, see `AutoMMPredictor.save()` for more detials. 
+            Note that `standalone = True` only works for `backen = pytorch` and does noting in `backen = mxnet`.
         """
 
-        self._predictor.save(path=path)
+        self._predictor.save(path=path,standalone=standalone)
 
     @classmethod
     def load(
@@ -393,17 +409,23 @@ class TextPredictor:
 
         """
         if backend == PYTORCH:
-            predictor = AutoMMPredictor.load(
+            _predictor = AutoMMPredictor.load(
                 path=path,
                 resume=resume,
             )
         elif backend == MXNET:
             from .mx_predictor import MXTextPredictor
-            predictor = MXTextPredictor.load(
+            _predictor = MXTextPredictor.load(
                 path=path,
                 verbosity=verbosity,
             )
         else:
             raise ValueError(f"Unknown backend: {backend}")
+
+        predictor = cls(
+            label=_predictor.label,
+        )
+        predictor._backend = backend
+        predictor._predictor = _predictor
 
         return predictor

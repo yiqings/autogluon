@@ -16,9 +16,12 @@ from sklearn.base import (
     TransformerMixin,
     BaseEstimator,
 )
-from ..constants import CATEGORICAL, NUMERICAL, TEXT, IMAGE_PATH, NULL
+from ..constants import (
+    CATEGORICAL, NUMERICAL, TEXT,
+    IMAGE_PATH, NULL, AUTOMM
+)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(AUTOMM)
 
 
 class MultiModalFeaturePreprocessor(TransformerMixin, BaseEstimator):
@@ -423,6 +426,7 @@ class MultiModalFeaturePreprocessor(TransformerMixin, BaseEstimator):
     def transform_prediction(
             self,
             y_pred: torch.Tensor,
+            inverse_categorical: bool = True,
     ) -> NDArray[(Any,), Any]:
         """
         Transform model's output logits into class labels for classification
@@ -432,6 +436,8 @@ class MultiModalFeaturePreprocessor(TransformerMixin, BaseEstimator):
         ----------
         y_pred
             The model's output logits.
+        inverse_categorical
+            Whether to transform categorical value back to the original space, e.g., string values.
 
         Returns
         -------
@@ -442,6 +448,9 @@ class MultiModalFeaturePreprocessor(TransformerMixin, BaseEstimator):
         if self.label_type == CATEGORICAL:
             assert y_pred.shape[1] >= 2
             y_pred = y_pred.argmax(axis=1)
+            # Transform the predicted label back to the original space (e.g., string values)
+            if inverse_categorical:
+                y_pred = self._label_generator.inverse_transform(y_pred)
         elif self.label_type == NUMERICAL:
             y_pred = self._label_scaler.inverse_transform(y_pred)
             y_pred = np.squeeze(y_pred)

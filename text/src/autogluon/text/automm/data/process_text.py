@@ -1,5 +1,6 @@
 import os
 import logging
+import pickle
 from typing import Optional, List, Any
 import numpy as np
 from nptyping import NDArray
@@ -15,11 +16,12 @@ from ..constants import (
     TEXT_TOKEN_IDS,
     TEXT_VALID_LENGTH,
     TEXT_SEGMENT_IDS,
+    AUTOMM,
 )
 from .collator import Stack, Pad
 from .utils import extract_value_from_config
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(AUTOMM)
 
 # Disable tokenizer parallelism
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -68,6 +70,8 @@ class TextProcessor:
             Whether to use stochastic chunking, which will randomly slice each individual text.
         """
         self.prefix = prefix
+        self.tokenizer_name = tokenizer_name
+        self.checkpoint_name = checkpoint_name
         self.tokenizer = self.get_pretrained_tokenizer(
             tokenizer_name=tokenizer_name,
             checkpoint_name=checkpoint_name,
@@ -129,7 +133,7 @@ class TextProcessor:
         fn = {}
         fn.update({f"{self.prefix}_{TEXT_TOKEN_IDS}": Pad(pad_val=self.tokenizer.pad_token_id)})
         fn.update({f"{self.prefix}_{TEXT_VALID_LENGTH}": Stack()})
-        fn.update({f"{self.prefix}_{TEXT_SEGMENT_IDS}": Pad(pad_val=self.tokenizer.pad_token_id)})
+        fn.update({f"{self.prefix}_{TEXT_SEGMENT_IDS}": Pad(pad_val=0)})
         return fn
 
     def build_one_token_sequence(

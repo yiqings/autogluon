@@ -25,16 +25,15 @@ OUTPUT = "output"
 WEIGHT = "weight"
 FEATURES = "features"
 
-# Log keys
-VAL_LOSS = "val_loss"
-VAL_ACC = "val_acc"
-TEST_ACC = "test_acc"
-MODE = "mode"
+# Metric
 MAX = "max"
 MIN = "min"
 ACCURACY = "accuracy"
 ACC = "acc"
 RMSE = "rmse"
+R2 = "r2"
+PEARSONR = "pearsonr"
+SPEARMANR = "spearmanr"
 QUADRATIC_KAPPA = "quadratic_kappa"
 
 # Training status
@@ -60,6 +59,7 @@ MODEL = "model"
 DATA = "data"
 OPTIMIZATION = "optimization"
 ENVIRONMENT = "environment"
+DISTILLER = "distiller"
 
 # Image normalization mean and std. This is only to normalize images for the CLIP model.
 CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -67,3 +67,29 @@ CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
 
 # Logger name
 AUTOMM = "automm"
+
+# environment variables
+AUTOMM_TUTORIAL_MODE = "AUTOMM_TUTORIAL_MODE"
+
+# error try
+GET_ITEM_ERROR_RETRY = 50
+
+# top-k checkpoint average methods
+UNIFORM_SOUP = "uniform_soup"
+GREEDY_SOUP = "greedy_soup"
+BEST = "best"
+
+# efficient finetuning strategies
+NORM_FIT = "norm_fit"
+BIT_FIT = "bit_fit"
+
+# registered model keys. TODO: document how to add new models.
+CLIP = "clip"
+TIMM_IMAGE = "timm_image"
+HF_TEXT = "hf_text"
+NUMERICAL_MLP = "numerical_mlp"
+CATEGORICAL_MLP = "categorical_mlp"
+NUMERICAL_TRANSFORMER = "numerical_transformer"
+CATEGORICAL_TRANSFORMER = "categorical_transformer"
+FUSION_MLP = "fusion_mlp"
+FUSION_TRANSFORMER = "fusion_transformer"

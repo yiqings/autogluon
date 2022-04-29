@@ -11,8 +11,9 @@ from .utils import (
     apply_single_lr,
 )
 from ..constants import LOGITS, WEIGHT
-from typing import Union, Optional, List, Dict
+from typing import Union, Optional, List, Dict, Callable
 import torchmetrics
+from torchmetrics.aggregation import BaseAggregator
 from torch.nn.modules.loss import _Loss
 
 logger = logging.getLogger(__name__)
@@ -38,8 +39,11 @@ class LitModule(pl.LightningModule):
             weight_decay: Optional[float] = None,
             warmup_steps: Optional[int] = None,
             loss_func: Optional[_Loss] = None,
-            val_metric: Optional[torchmetrics.Metric] = None,
+            validation_metric: Optional[torchmetrics.Metric] = None,
+            validation_metric_name: Optional[str] = None,
+            custom_metric_func: Callable = None,
             test_metric: Optional[torchmetrics.Metric] = None,
+            efficient_finetune: Optional[str] = None,
     ):
         """
         Parameters
@@ -82,53 +86,69 @@ class LitModule(pl.LightningModule):
             "int(warmup_steps * max_steps)". If an integer, it would be the exact step number.
         loss_func
             A Pytorch loss module, e.g., nn.CrossEntropyLoss().
-        val_metric
+        validation_metric
             A torchmetrics module used in the validation stage, e.g., torchmetrics.Accuracy().
+        validation_metric_name
+            Name of validation metric in case that validation_metric is a aggregation metric,
+            e.g., torchmetrics.MeanMetric, whose name can't reflect the real metric name.
+        custom_metric_func
+            A customized metric function in case that torchmetrics doesn't have the metric.
+            It is generally used together with torchmetrics' aggregators, e.g., torchmetrics.MeanMetric.
+            Refer to https://github.com/PyTorchLightning/metrics/blob/master/torchmetrics/aggregation.py
         test_metric
             A torchmetrics module used in the test stage, e.g., torchmetrics.Accuracy().
+        efficient_finetune
+            Whether to use efficient finetuning strategies. This will be helpful for fast finetuning of large backbones.
+            We support options such as:
+
+            - bit_fit (only finetune the bias terms)
+            - norm_fit (only finetune the weights in norm layers / bias layer)
+            - None (do not use efficient finetuning strategies)
+
         """
         super().__init__()
-        self.save_hyperparameters(ignore=["model", "val_metric", "test_metric", "loss_func"])
+        self.save_hyperparameters(ignore=["model", "validation_metric", "test_metric", "loss_func"])
         self.model = model
-        self.val_metric = val_metric
-        if val_metric is not None:
-            self.val_metric_name = f"val_{val_metric.__class__.__name__}"
+        self.validation_metric = validation_metric
+        self.validation_metric_name = f"val_{validation_metric_name}"
         self.loss_func = loss_func
+        if isinstance(validation_metric, BaseAggregator) and custom_metric_func is None:
+            raise ValueError(
+                f"validation_metric {validation_metric} is an aggregation metric,"
+                f"which must be used with a customized metric function."
+            )
+        self.custom_metric_func = custom_metric_func
 
     def _compute_loss(
             self,
-            output: Union[Dict, List[Dict]],
+            output: Dict,
             label: torch.Tensor,
     ):
-        if isinstance(output, dict):
-            output = [output]
-
         loss = 0
-        for per_output in output:
+        for _, per_output in output.items():
             weight = per_output[WEIGHT] if WEIGHT in per_output else 1
-            loss += self.loss_func(per_output[LOGITS].squeeze(dim=1), label) * weight
+            loss += self.loss_func(
+                input=per_output[LOGITS].squeeze(dim=1),
+                target=label,
+            ) * weight
         return loss
 
     def _compute_metric(
             self,
-            output: Union[Dict, List[Dict]],
+            logits: torch.Tensor,
             label: torch.Tensor,
     ):
-        if isinstance(output, dict):
-            logits = output[LOGITS]
-        else:
-            # use only the last logits, which is the fusion logits
-            logits = output[-1][LOGITS]
-
-        if isinstance(self.val_metric, torchmetrics.AUROC):
+        if isinstance(self.validation_metric, torchmetrics.AUROC):
             prob = F.softmax(logits.float(), dim=1)
-            return self.val_metric(preds=prob[:, 1], target=label)  # only for binary classification
+            return self.validation_metric(preds=prob[:, 1], target=label)  # only for binary classification
+        elif isinstance(self.validation_metric, BaseAggregator):
+            return self.validation_metric(self.custom_metric_func(logits, label))
         else:
-            return self.val_metric(logits.squeeze(dim=1), label)
+            return self.validation_metric(logits.squeeze(dim=1), label)
 
     def _shared_step(
             self,
-            batch: dict,
+            batch: Dict,
     ):
         output = self.model(batch)
         label = batch[self.model.label_key]
@@ -178,8 +198,11 @@ class LitModule(pl.LightningModule):
         # By default, on_step=False and on_epoch=True
         self.log("val_loss", loss)
         self.log(
-            self.val_metric_name,
-            self._compute_metric(output=output, label=batch[self.model.label_key]),
+            self.validation_metric_name,
+            self._compute_metric(
+                logits=output[self.model.prefix][LOGITS],
+                label=batch[self.model.label_key],
+            ),
         )
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
@@ -203,11 +226,7 @@ class LitModule(pl.LightningModule):
         A dictionary with the mini-batch's logits and features.
         """
         output = self.model(batch)
-        if isinstance(output, dict):
-            ret = output
-        else:
-            ret = output[-1]
-        return ret
+        return output[self.model.prefix]
 
     def configure_optimizers(self):
         """
@@ -220,29 +239,29 @@ class LitModule(pl.LightningModule):
         [sched]
             Learning rate scheduler.
         """
+        kwargs = dict(
+            model=self.model,
+            lr=self.hparams.lr,
+            weight_decay=self.hparams.weight_decay,
+        )
         if self.hparams.lr_choice == "two_stages":
             logger.debug("applying 2-stage learning rate...")
             grouped_parameters = apply_two_stages_lr(
-                model=self.model,
-                lr=self.hparams.lr,
                 lr_mult=self.hparams.lr_mult,
-                weight_decay=self.hparams.weight_decay,
                 return_params=True,
+                **kwargs,
             )
         elif self.hparams.lr_choice == "layerwise_decay":
             logger.debug("applying layerwise learning rate decay...")
             grouped_parameters = apply_layerwise_lr_decay(
-                model=self.model,
-                lr=self.hparams.lr,
                 lr_decay=self.hparams.lr_decay,
-                weight_decay=self.hparams.weight_decay,
+                efficient_finetune=self.hparams.efficient_finetune,
+                **kwargs,
             )
         else:
             logger.debug("applying single learning rate...")
             grouped_parameters = apply_single_lr(
-                model=self.model,
-                lr=self.hparams.lr,
-                weight_decay=self.hparams.weight_decay,
+                **kwargs,
             )
 
         optimizer = get_optimizer(
@@ -259,8 +278,10 @@ class LitModule(pl.LightningModule):
                     * self.trainer.max_epochs
                     // self.trainer.accumulate_grad_batches
             )
-            logger.debug(f"len(trainer.datamodule.train_dataloader()): "
-                  f"{len(self.trainer.datamodule.train_dataloader())}")
+            logger.debug(
+                f"len(trainer.datamodule.train_dataloader()): "
+                f"{len(self.trainer.datamodule.train_dataloader())}"
+            )
             logger.debug(f"trainer.max_epochs: {self.trainer.max_epochs}")
             logger.debug(f"trainer.accumulate_grad_batches: {self.trainer.accumulate_grad_batches}")
         else:
@@ -274,11 +295,13 @@ class LitModule(pl.LightningModule):
 
         logger.debug(f"warmup steps: {warmup_steps}")
         logger.debug(f"lr_schedule: {self.hparams.lr_schedule}")
-        scheduler = get_lr_scheduler(optimizer=optimizer,
-                                     num_max_steps=max_steps,
-                                     num_warmup_steps=warmup_steps,
-                                     lr_schedule=self.hparams.lr_schedule,
-                                     end_lr=self.hparams.end_lr)
+        scheduler = get_lr_scheduler(
+            optimizer=optimizer,
+            num_max_steps=max_steps,
+            num_warmup_steps=warmup_steps,
+            lr_schedule=self.hparams.lr_schedule,
+            end_lr=self.hparams.end_lr,
+        )
 
         sched = {"scheduler": scheduler, "interval": "step"}
         logger.debug("done configuring optimizer and scheduler")
