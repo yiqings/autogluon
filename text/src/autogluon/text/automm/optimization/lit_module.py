@@ -10,13 +10,14 @@ from .utils import (
     apply_layerwise_lr_decay,
     apply_single_lr,
 )
-from ..constants import LOGITS, WEIGHT
+from ..constants import LOGITS, WEIGHT, AUTOMM
 from typing import Union, Optional, List, Dict, Callable
+from ..data.mixup import MixupModule, multimodel_mixup
 import torchmetrics
 from torchmetrics.aggregation import BaseAggregator
 from torch.nn.modules.loss import _Loss
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(AUTOMM)
 
 
 class LitModule(pl.LightningModule):
@@ -27,23 +28,25 @@ class LitModule(pl.LightningModule):
     """
 
     def __init__(
-            self,
-            model: nn.Module,
-            optim_type: Optional[str] = None,
-            lr_choice: Optional[str] = None,
-            lr_schedule: Optional[str] = None,
-            lr: Optional[float] = None,
-            lr_decay: Optional[float] = None,
-            end_lr: Optional[Union[float, int]] = None,
-            lr_mult: Optional[Union[float, int]] = None,
-            weight_decay: Optional[float] = None,
-            warmup_steps: Optional[int] = None,
-            loss_func: Optional[_Loss] = None,
-            validation_metric: Optional[torchmetrics.Metric] = None,
-            validation_metric_name: Optional[str] = None,
-            custom_metric_func: Callable = None,
-            test_metric: Optional[torchmetrics.Metric] = None,
-            efficient_finetune: Optional[str] = None,
+        self,
+        model: nn.Module,
+        optim_type: Optional[str] = None,
+        lr_choice: Optional[str] = None,
+        lr_schedule: Optional[str] = None,
+        lr: Optional[float] = None,
+        lr_decay: Optional[float] = None,
+        end_lr: Optional[Union[float, int]] = None,
+        lr_mult: Optional[Union[float, int]] = None,
+        weight_decay: Optional[float] = None,
+        warmup_steps: Optional[int] = None,
+        loss_func: Optional[_Loss] = None,
+        validation_metric: Optional[torchmetrics.Metric] = None,
+        validation_metric_name: Optional[str] = None,
+        custom_metric_func: Callable = None,
+        test_metric: Optional[torchmetrics.Metric] = None,
+        efficient_finetune: Optional[str] = None,
+        mixup_fn: Optional[MixupModule] = None,
+        mixup_off_epoch: Optional[int] = 0,
     ):
         """
         Parameters
@@ -112,46 +115,57 @@ class LitModule(pl.LightningModule):
         self.validation_metric = validation_metric
         self.validation_metric_name = f"val_{validation_metric_name}"
         self.loss_func = loss_func
+        self.mixup_fn = mixup_fn
         if isinstance(validation_metric, BaseAggregator) and custom_metric_func is None:
             raise ValueError(
                 f"validation_metric {validation_metric} is an aggregation metric,"
-                f"which must be used with a customized metric function."
+                "which must be used with a customized metric function."
             )
         self.custom_metric_func = custom_metric_func
 
     def _compute_loss(
-            self,
-            output: Dict,
-            label: torch.Tensor,
+        self,
+        output: Dict,
+        label: torch.Tensor,
     ):
         loss = 0
         for _, per_output in output.items():
             weight = per_output[WEIGHT] if WEIGHT in per_output else 1
-            loss += self.loss_func(
-                input=per_output[LOGITS].squeeze(dim=1),
-                target=label,
-            ) * weight
+            loss += (
+                self.loss_func(
+                    input=per_output[LOGITS].squeeze(dim=1),
+                    target=label,
+                )
+                * weight
+            )
         return loss
 
-    def _compute_metric(
-            self,
-            logits: torch.Tensor,
-            label: torch.Tensor,
+    def _compute_metric_score(
+        self,
+        metric: torchmetrics.Metric,
+        custom_metric_func: Callable,
+        logits: torch.Tensor,
+        label: torch.Tensor,
     ):
-        if isinstance(self.validation_metric, torchmetrics.AUROC):
+        if isinstance(self.loss_func, nn.BCEWithLogitsLoss):
+            logits = torch.sigmoid(logits)
+        if isinstance(metric, (torchmetrics.AUROC, torchmetrics.AveragePrecision)):
             prob = F.softmax(logits.float(), dim=1)
-            return self.validation_metric(preds=prob[:, 1], target=label)  # only for binary classification
-        elif isinstance(self.validation_metric, BaseAggregator):
-            return self.validation_metric(self.custom_metric_func(logits, label))
+            metric.update(preds=prob[:, 1], target=label)  # only for binary classification
+        elif isinstance(metric, BaseAggregator):
+            metric.update(custom_metric_func(logits, label))
         else:
-            return self.validation_metric(logits.squeeze(dim=1), label)
+            metric.update(logits.squeeze(dim=1), label)
 
     def _shared_step(
-            self,
-            batch: Dict,
+        self,
+        batch: Dict,
     ):
-        output = self.model(batch)
         label = batch[self.model.label_key]
+        if self.mixup_fn is not None:
+            self.mixup_fn.mixup_enabled = self.training & (self.current_epoch < self.hparams.mixup_off_epoch)
+            batch, label = multimodel_mixup(batch=batch, model=self.model, mixup_fn=self.mixup_fn)
+        output = self.model(batch)
         loss = self._compute_loss(output=output, label=label)
         return output, loss
 
@@ -197,12 +211,17 @@ class LitModule(pl.LightningModule):
         output, loss = self._shared_step(batch)
         # By default, on_step=False and on_epoch=True
         self.log("val_loss", loss)
+        self._compute_metric_score(
+            metric=self.validation_metric,
+            custom_metric_func=self.custom_metric_func,
+            logits=output[self.model.prefix][LOGITS],
+            label=batch[self.model.label_key],
+        ),
         self.log(
             self.validation_metric_name,
-            self._compute_metric(
-                logits=output[self.model.prefix][LOGITS],
-                label=batch[self.model.label_key],
-            ),
+            self.validation_metric,
+            on_step=False,
+            on_epoch=True,
         )
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
@@ -274,13 +293,12 @@ class LitModule(pl.LightningModule):
         logger.debug(f"trainer.max_steps: {self.trainer.max_steps}")
         if self.trainer.max_steps is None or -1:
             max_steps = (
-                    len(self.trainer.datamodule.train_dataloader())
-                    * self.trainer.max_epochs
-                    // self.trainer.accumulate_grad_batches
+                len(self.trainer.datamodule.train_dataloader())
+                * self.trainer.max_epochs
+                // self.trainer.accumulate_grad_batches
             )
             logger.debug(
-                f"len(trainer.datamodule.train_dataloader()): "
-                f"{len(self.trainer.datamodule.train_dataloader())}"
+                f"len(trainer.datamodule.train_dataloader()): {len(self.trainer.datamodule.train_dataloader())}"
             )
             logger.debug(f"trainer.max_epochs: {self.trainer.max_epochs}")
             logger.debug(f"trainer.accumulate_grad_batches: {self.trainer.accumulate_grad_batches}")

@@ -1,5 +1,8 @@
 from typing import Optional, Union, Tuple, List, Dict
+import torch
 from torch import nn
+from ..constants import MASKS, COLUMN_FEATURES, FEATURES
+from .lora_layers import LoRALinear
 
 
 def init_weights(module: nn.Module):
@@ -24,7 +27,7 @@ def init_weights(module: nn.Module):
 
 
 def assign_encoder_layer_ids(
-        encoder_names: List[List[str]],
+    encoder_names: List[List[str]],
 ):
     """
     Assign ids to encoder layers. The encoder may contain several blocks e.g., block1 and block2.
@@ -49,7 +52,7 @@ def assign_encoder_layer_ids(
         last_inferred_id = -1
         for n in group_names:
             detect_id = False
-            n_splits = n.split('.')
+            n_splits = n.split(".")
 
             for split in n_splits:
                 # the first digit encountered is used to infer layer id
@@ -75,8 +78,8 @@ def assign_encoder_layer_ids(
 
 
 def assign_non_encoder_layer_ids(
-        non_encoder_names: List[str],
-        layer_id: int,
+    non_encoder_names: List[str],
+    layer_id: int,
 ):
     """
     Assign the provided id to non-encoder layers.
@@ -133,10 +136,10 @@ def split_encoder_non_encoder(names: List[str]):
 
 
 def group_param_names(
-        names: List[str],
-        pre_encoder_patterns: Tuple[str, ...],
-        post_encoder_patterns: Tuple[str, ...],
-        model_prefix: Optional[str] = None,
+    names: List[str],
+    pre_encoder_patterns: Tuple[str, ...],
+    post_encoder_patterns: Tuple[str, ...],
+    model_prefix: Optional[str] = None,
 ):
     """
     Group layer names into three types: pre-encoder, encoder, and post-encoder.
@@ -185,7 +188,7 @@ def group_param_names(
     # split blocks at the first level
     children_prefix = []
     for n in selected_names:
-        child_name = n[len(model_prefix)+1:].split(".")[0]
+        child_name = n[len(model_prefix) + 1 :].split(".")[0]
         child_prefix = f"{model_prefix}.{child_name}"
         if child_prefix not in children_prefix:
             children_prefix.append(child_prefix)
@@ -213,9 +216,9 @@ def group_param_names(
 
 
 def reverse_layer_ids(
-        encoder_name_to_id: dict,
-        pre_enocder_name_to_id: dict,
-        post_enocder_name_to_id: dict,
+    encoder_name_to_id: dict,
+    pre_enocder_name_to_id: dict,
+    post_enocder_name_to_id: dict,
 ):
     """
     The layer ids need to increase when going from the output end to the input end.
@@ -247,10 +250,10 @@ def reverse_layer_ids(
 
 
 def assign_layer_ids(
-        names: List[str],
-        pre_encoder_patterns: Tuple[str, ...],
-        post_encoder_patterns: Tuple[str, ...],
-        model_pre: Optional[str] = None,
+    names: List[str],
+    pre_encoder_patterns: Tuple[str, ...],
+    post_encoder_patterns: Tuple[str, ...],
+    model_pre: Optional[str] = None,
 ):
     """
     Assign ids to all layers. It splits a model into three parts: pre-encoder, encoder, and post-encoder.
@@ -280,39 +283,146 @@ def assign_layer_ids(
     left_names
         The layer names not starting with the "model_pre".
     """
-    left_names, encoder_names, pre_encoder_names, post_encoder_names = \
-        group_param_names(
-            names=names,
-            pre_encoder_patterns=pre_encoder_patterns,
-            post_encoder_patterns=post_encoder_patterns,
-            model_prefix=model_pre,
-        )
+    left_names, encoder_names, pre_encoder_names, post_encoder_names = group_param_names(
+        names=names,
+        pre_encoder_patterns=pre_encoder_patterns,
+        post_encoder_patterns=post_encoder_patterns,
+        model_prefix=model_pre,
+    )
     # add a constraint
     if len(encoder_names) == 0 and len(pre_encoder_names) != 0:
-        raise ValueError(
-            f"encoder_names is empty, but pre_encoder_names has values: {pre_encoder_names}"
-        )
+        raise ValueError(f"encoder_names is empty, but pre_encoder_names has values: {pre_encoder_names}")
 
-    encoder_name_to_id, encoder_layer_num = \
-        assign_encoder_layer_ids(
-            encoder_names=encoder_names,
-        )
+    encoder_name_to_id, encoder_layer_num = assign_encoder_layer_ids(
+        encoder_names=encoder_names,
+    )
 
-    pre_encoder_name_to_id = \
-        assign_non_encoder_layer_ids(
-            non_encoder_names=pre_encoder_names,
-            layer_id=0
-        )
+    pre_encoder_name_to_id = assign_non_encoder_layer_ids(non_encoder_names=pre_encoder_names, layer_id=0)
 
-    post_encoder_name_to_id = \
-        assign_non_encoder_layer_ids(
-            non_encoder_names=post_encoder_names,
-            layer_id=encoder_layer_num + 1
-        )
+    post_encoder_name_to_id = assign_non_encoder_layer_ids(
+        non_encoder_names=post_encoder_names, layer_id=encoder_layer_num + 1
+    )
 
     name_to_id = reverse_layer_ids(
         encoder_name_to_id=encoder_name_to_id,
         pre_enocder_name_to_id=pre_encoder_name_to_id,
-        post_enocder_name_to_id=post_encoder_name_to_id
+        post_enocder_name_to_id=post_encoder_name_to_id,
     )
     return name_to_id, left_names
+
+
+def get_column_features(
+    batch: Dict[str, torch.Tensor],
+    column_name_prefix: str,
+    features: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    has_cls_feature: bool,
+):
+    """
+    Index the features of one column defined by `column_name_prefix`.
+    This function can be used to index both image and text features.
+    The features have shape (b, n, d), where n can be the image number or
+    text token number. One column corresponds to a subset of
+    the n images or text tokens. One column name can only appear once in the return.
+
+    Parameters
+    ----------
+    batch
+        The batch input containing the feature column information, i.e., indexes.
+    column_name_prefix
+        The column name prefix of one modality (image or text).
+    features
+        The features of columns whose names starts with column_name_prefix.
+    valid_lengths
+        The valid image number or text token number of each sample in a batch.
+    has_cls_feature
+        Whether the features include the cls feature. If True, then the joined names of all
+        columns share the cls feature.
+
+    Returns
+    -------
+    The column features with masks. If the column has no valid features, its
+    mask is 0.
+    """
+    column_features = {}
+    feature_masks = {}
+
+    cut_idx = len(column_name_prefix) + 1
+    if has_cls_feature:
+        all_column_names = []
+        # creat a zero mask to do logical_or with each column's mask
+        joint_mask = torch.zeros(features.shape[0]).to(features)  # (b,)
+    for key in batch:
+        if key.startswith(column_name_prefix):
+            per_col_features = []
+            per_col_masks = torch.zeros(features.shape[0]).to(features)  # (b,)
+            assert batch[key].ndim == 2 and batch[key].shape[1] == 2
+            for i, per_sample_col_idx in enumerate(batch[key]):
+                start_idx = per_sample_col_idx[0]
+                end_idx = per_sample_col_idx[1]
+                if start_idx < end_idx:
+                    assert end_idx <= valid_lengths[i]
+                    per_col_features.append(features[i, start_idx:end_idx].mean(dim=0))
+                    per_col_masks[i] = 1
+                else:  # the column has no valid image/text.
+                    per_col_features.append(torch.zeros_like(features[0, 0]))
+                    per_col_masks[i] = 0
+            column_name = key[cut_idx:]
+            column_features[column_name] = torch.stack(per_col_features, dim=0)  # (b, num_features)
+            feature_masks[column_name] = per_col_masks  # (b,)
+            if has_cls_feature:
+                all_column_names.append(column_name)
+                joint_mask = torch.logical_or(joint_mask, per_col_masks)
+
+    # all the columns of one model's input share the model's cls feature
+    if (
+        has_cls_feature and len(all_column_names) > 0
+    ):  # some models', e.g, timm_image, output doesn't have the cls feature.
+        joint_column_name = "_".join(all_column_names)
+        column_features[joint_column_name] = features[:, 0, :]
+        feature_masks[joint_column_name] = joint_mask.to(features)
+        # remove the individual column features since these column features not independent
+        for column_name in all_column_names:
+            column_features.pop(column_name)
+            feature_masks.pop(column_name)
+
+    return column_features, feature_masks
+
+
+def inject_lora_to_linear_layer(
+    model: nn.Module, lora_r: int, lora_alpha: int, filter: Optional[List[str]] = None
+) -> nn.Module:
+    """
+    Injects trainable Low-Rank decomposition matrices (LoRA) into linear
+    layers of a PyTorch model. Used for efficient fine-tuning of large
+    pre-trained models.
+
+    Parameters
+    ----------
+    model
+        A PyTorch model.
+    lora_r
+        The rank r of the low-rank decomposition.
+    lora_alpha
+        The scaling factor. Can be set to same value as r in
+        most cases, as initialization is scaled already.
+    filter
+        Apply LoRa only to linear layers filtered by name.
+        If None, LoRA is applied to all linear Layers in Model.
+    Returns
+    -------
+    Model with injected LoRA modules.
+    """
+    for n, module in model.named_children():
+        if len(list(module.children())) > 0:
+            inject_lora_to_linear_layer(module, lora_r, lora_alpha, filter)  # algorithm is in-place
+
+        if isinstance(module, nn.Linear) and (not filter or any(x in n for x in filter)):
+            lora_layer = LoRALinear(
+                module.in_features, module.out_features, r=lora_r, lora_alpha=lora_alpha, merge_weights=False
+            )
+            lora_layer.weight = module.weight
+            lora_layer.bias = module.bias
+            setattr(model, n, lora_layer)
+
+    return model  # return model to enable method chaining

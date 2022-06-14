@@ -5,11 +5,23 @@ import warnings
 from transformers import AutoModel, AutoTokenizer
 from transformers import logging as hf_logging
 from ..constants import (
-    TEXT_TOKEN_IDS, TEXT_VALID_LENGTH, TEXT_SEGMENT_IDS,
-    LABEL, LOGITS, FEATURES, AUTOMM
+    TEXT_TOKEN_IDS,
+    TEXT_VALID_LENGTH,
+    TEXT_SEGMENT_IDS,
+    LABEL,
+    LOGITS,
+    FEATURES,
+    AUTOMM,
+    COLUMN,
+    COLUMN_FEATURES,
+    MASKS,
 )
 from typing import Optional, List, Tuple
-from .utils import assign_layer_ids, init_weights
+from .utils import (
+    assign_layer_ids,
+    init_weights,
+    get_column_features,
+)
 
 hf_logging.set_verbosity_error()
 
@@ -23,10 +35,10 @@ class HFAutoModelForTextPrediction(nn.Module):
     """
 
     def __init__(
-            self,
-            prefix: str,
-            checkpoint_name: str = 'microsoft/deberta-v3-base',
-            num_classes: Optional[int] = 0,
+        self,
+        prefix: str,
+        checkpoint_name: str = "microsoft/deberta-v3-base",
+        num_classes: Optional[int] = 0,
     ):
         """
         Load a pretrained huggingface text transformer backbone.
@@ -65,7 +77,7 @@ class HFAutoModelForTextPrediction(nn.Module):
         self.name_to_id = self.get_layer_ids()
         self.head_layer_names = [n for n, layer_id in self.name_to_id.items() if layer_id == 0]
 
-        if hasattr(self.model.config, 'type_vocab_size') and self.model.config.type_vocab_size <= 1:
+        if hasattr(self.model.config, "type_vocab_size") and self.model.config.type_vocab_size <= 1:
             # Disable segment ids for models like RoBERTa
             self.disable_seg_ids = True
         else:
@@ -87,9 +99,17 @@ class HFAutoModelForTextPrediction(nn.Module):
     def label_key(self):
         return f"{self.prefix}_{LABEL}"
 
+    @property
+    def text_column_prefix(self):
+        return f"{self.text_token_ids_key}_{COLUMN}"
+
+    @property
+    def text_feature_dim(self):
+        return self.model.config.hidden_size
+
     def forward(
-            self,
-            batch: dict,
+        self,
+        batch: dict,
     ):
         """
         Parameters
@@ -121,12 +141,25 @@ class HFAutoModelForTextPrediction(nn.Module):
 
         logits = self.head(cls_features)
 
-        return {
-            self.prefix: {
+        ret = {COLUMN_FEATURES: {FEATURES: {}, MASKS: {}}}
+        column_features, column_feature_masks = get_column_features(
+            batch=batch,
+            column_name_prefix=self.text_column_prefix,
+            features=outputs.last_hidden_state,
+            valid_lengths=text_valid_length,
+            has_cls_feature=True,
+        )
+        ret[COLUMN_FEATURES][FEATURES].update(column_features)
+        ret[COLUMN_FEATURES][MASKS].update(column_feature_masks)
+
+        ret.update(
+            {
                 LOGITS: logits,
                 FEATURES: cls_features,
             }
-        }
+        )
+
+        return {self.prefix: ret}
 
     def get_layer_ids(self):
 
