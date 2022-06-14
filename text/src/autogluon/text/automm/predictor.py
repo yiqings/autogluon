@@ -9,8 +9,9 @@ import shutil
 from datetime import timedelta
 import pandas as pd
 import pickle
-import torch
 import copy
+import yaml
+import torch
 from torch import nn
 from torch.nn.modules.loss import _Loss
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ import torchmetrics
 from omegaconf import OmegaConf, DictConfig
 import operator
 import pytorch_lightning as pl
+from pytorch_lightning.utilities.types import _METRIC
 from typing import Optional, List, Dict, Union, Callable
 from sklearn.model_selection import train_test_split
 from autogluon.core.utils.utils import default_holdout_frac
@@ -26,15 +28,37 @@ from autogluon.common.utils.log_utils import set_logger_verbosity
 from autogluon.common.utils.utils import setup_outputdir
 
 from .constants import (
-    LABEL, BINARY, MULTICLASS, REGRESSION, Y_PRED,
-    Y_PRED_PROB, Y_TRUE, LOGITS, FEATURES, AUTOMM,
-    AUTOMM_TUTORIAL_MODE, UNIFORM_SOUP, GREEDY_SOUP,
-    BEST, MIN, MAX, TEXT,
+    LABEL,
+    BINARY,
+    MULTICLASS,
+    REGRESSION,
+    Y_PRED,
+    Y_PRED_PROB,
+    Y_TRUE,
+    LOGITS,
+    FEATURES,
+    AUTOMM,
+    AUTOMM_TUTORIAL_MODE,
+    UNIFORM_SOUP,
+    GREEDY_SOUP,
+    BEST,
+    MIN,
+    MAX,
+    TEXT,
+    RAY_TUNE_CHECKPOINT,
+    BEST_K_MODELS_FILE,
+    LAST_CHECKPOINT,
+    MODEL_CHECKPOINT,
+    MODEL,
+    DATA,
+    PROBABILITY,
+    MATCHER,
 )
 
 from .data.datamodule import BaseDataModule
 from .data.infer_types import infer_column_problem_types
 from .data.preprocess_dataframe import MultiModalFeaturePreprocessor
+from .data.mixup import MixupModule
 
 from .utils import (
     create_model,
@@ -45,6 +69,8 @@ from .utils import (
     compute_score,
     average_checkpoints,
     infer_metrics,
+    get_minmax_mode,
+    filter_search_space,
     get_config,
     LogFilter,
     apply_log_filter,
@@ -53,17 +79,47 @@ from .utils import (
     save_text_tokenizers,
     load_text_tokenizers,
     modify_duplicate_model_names,
+    assign_feature_column_names,
+    turn_on_off_feature_column_info,
+    try_to_infer_pos_label,
+    get_mixup,
 )
 from .optimization.utils import (
     get_metric,
     get_loss_func,
+    update_config_by_rules,
 )
 from .optimization.lit_module import LitModule
 from .optimization.lit_distiller import DistillerLitModule
+from .optimization.lit_matcher import MatcherLitModule
 
 from .. import version as ag_version
 
 logger = logging.getLogger(AUTOMM)
+
+
+class AutoMMModelCheckpoint(pl.callbacks.ModelCheckpoint):
+    """
+    Class that inherits pl.callbacks.ModelCheckpoint. The purpose is to resolve the potential issues in lightning.
+
+    - Issue1:
+
+    It solves the issue described in https://github.com/PyTorchLightning/pytorch-lightning/issues/5582.
+    For ddp_spawn, the checkpoint_callback.best_k_models will be empty.
+    Here, we resolve it by storing the best_models to "SAVE_DIR/best_k_models.yaml".
+
+    """
+
+    def _update_best_and_save(
+        self,
+        current: torch.Tensor,
+        trainer: "pl.Trainer",
+        monitor_candidates: Dict[str, _METRIC],
+    ) -> None:
+        super(AutoMMModelCheckpoint, self)._update_best_and_save(
+            current=current, trainer=trainer, monitor_candidates=monitor_candidates
+        )
+        self.to_yaml()
 
 
 class AutoMMPredictor:
@@ -74,14 +130,14 @@ class AutoMMPredictor:
     """
 
     def __init__(
-            self,
-            label: str,
-            problem_type: Optional[str] = None,
-            eval_metric: Optional[str] = None,
-            path: Optional[str] = None,
-            verbosity: Optional[int] = 3,
-            warn_if_exist: Optional[bool] = True,
-            enable_progress_bar: Optional[bool] = None,
+        self,
+        label: str,
+        problem_type: Optional[str] = None,
+        eval_metric: Optional[str] = None,
+        path: Optional[str] = None,
+        verbosity: Optional[int] = 3,
+        warn_if_exist: Optional[bool] = True,
+        enable_progress_bar: Optional[bool] = None,
     ):
         """
         Parameters
@@ -118,7 +174,12 @@ class AutoMMPredictor:
         if eval_metric is not None and not isinstance(eval_metric, str):
             eval_metric = eval_metric.name
 
-        if eval_metric is not None and eval_metric.lower() in ["rmse", "r2", "pearsonr", "spearmanr"]:
+        if eval_metric is not None and eval_metric.lower() in [
+            "rmse",
+            "r2",
+            "pearsonr",
+            "spearmanr",
+        ]:
             problem_type = REGRESSION
 
         if os.environ.get(AUTOMM_TUTORIAL_MODE):
@@ -142,6 +203,7 @@ class AutoMMPredictor:
         self._data_processors = None
         self._model = None
         self._resume = False
+        self._continuous_training = False
         self._verbosity = verbosity
         self._warn_if_exist = warn_if_exist
         self._enable_progress_bar = enable_progress_bar if enable_progress_bar is not None else True
@@ -163,17 +225,18 @@ class AutoMMPredictor:
         set_logger_verbosity(verbosity, logger=logger)
 
     def fit(
-            self,
-            train_data: pd.DataFrame,
-            config: Optional[dict] = None,
-            tuning_data: Optional[pd.DataFrame] = None,
-            time_limit: Optional[int] = None,
-            save_path: Optional[str] = None,
-            hyperparameters: Optional[Union[str, Dict, List[str]]] = None,
-            column_types: Optional[dict] = None,
-            holdout_frac: Optional[float] = None,
-            teacher_predictor: Union[str, AutoMMPredictor] = None,
-            seed: Optional[int] = 123,
+        self,
+        train_data: pd.DataFrame,
+        config: Optional[dict] = None,
+        tuning_data: Optional[pd.DataFrame] = None,
+        time_limit: Optional[int] = None,
+        save_path: Optional[str] = None,
+        hyperparameters: Optional[Union[str, Dict, List[str]]] = None,
+        column_types: Optional[dict] = None,
+        holdout_frac: Optional[float] = None,
+        teacher_predictor: Union[str, AutoMMPredictor] = None,
+        seed: Optional[int] = 123,
+        hyperparameter_tune_kwargs: Optional[dict] = None,
     ):
         """
         Fit AutoMMPredictor predict label column of a dataframe based on the other columns,
@@ -254,20 +317,47 @@ class AutoMMPredictor:
             knowledge to a student predictor, i.e., the current predictor.
         seed
             The random seed to use for this training run.
+        hyperparameter_tune_kwargs
+                Hyperparameter tuning strategy and kwargs (for example, how many HPO trials to run).
+                If None, then hyperparameter tuning will not be performed.
+                    num_trials: int
+                        How many HPO trials to run. Either `num_trials` or `time_limit` to `fit` needs t o be specified.
+                    scheduler: Union[str, ray.tune.schedulers.TrialScheduler]
+                        If str is passed, AutoGluon will create the scheduler for you with some default parameters.
+                        If ray.tune.schedulers.TrialScheduler object is passed, you are responsible for initializing the object.
+                    scheduler_init_args: Optional[dict] = None
+                        If provided str to `scheduler`, you can optionally provide custom init_args to the scheduler
+                    searcher: Union[str, ray.tune.suggest.SearchAlgorithm, ray.tune.suggest.Searcher]
+                        If str is passed, AutoGluon will create the searcher for you with some default parameters.
+                        If ray.tune.schedulers.TrialScheduler object is passed, you are responsible for initializing the object.
+                        You don't need to worry about `metric` and `mode` of the searcher object. AutoGluon will figure it out by itself.
+                    scheduler_init_args: Optional[dict] = None
+                        If provided str to `searcher`, you can optionally provide custom init_args to the searcher
+                        You don't need to worry about `metric` and `mode`. AutoGluon will figure it out by itself.
 
         Returns
         -------
         An "AutoMMPredictor" object (itself).
         """
+        if hyperparameter_tune_kwargs is not None:
+            # TODO: can we support hyperparameters being the same format as regular training?
+            # currently the string format would make it very hard to get search space, which is an object
+            assert isinstance(
+                hyperparameters, dict
+            ), "Please provide hyperparameters as a dictionary if you want to do HPO"
+            if teacher_predictor is not None:
+                assert isinstance(
+                    teacher_predictor, str
+                ), "HPO with distillation only supports passing a path to the predictor"
+            if self._continuous_training:
+                warnings.warn(
+                    "HPO while continuous training."
+                    "Hyperparameters related to Model and Data will NOT take effect."
+                    "We will filter them out from the search space."
+                )
+                hyperparameters = filter_search_space(hyperparameters, [MODEL, DATA])
+
         pl.seed_everything(seed, workers=True)
-
-        if self._config is not None:  # continuous training
-            config = self._config
-
-        config = get_config(
-            config=config,
-            overrides=hyperparameters,
-        )
 
         if self._resume or save_path is None:
             save_path = self._save_path
@@ -279,8 +369,12 @@ class AutoMMPredictor:
                 path=save_path,
                 warn_if_exist=self._warn_if_exist,
             )
+        else:
+            assert hyperparameter_tune_kwargs is None, "You can not resume training with HPO"
+        save_path = os.path.abspath(save_path)
         logger.debug(f"save path: {save_path}")
 
+        # Generate general info that's not config specific
         if tuning_data is None:
             if self._problem_type in [BINARY, MULTICLASS]:
                 stratify = train_data[self._label_column]
@@ -294,17 +388,16 @@ class AutoMMPredictor:
                 train_data,
                 test_size=val_frac,
                 stratify=stratify,
-                random_state=np.random.RandomState(seed)
+                random_state=np.random.RandomState(seed),
             )
 
-        column_types, problem_type, output_shape = \
-            infer_column_problem_types(
-                train_df=train_data,
-                valid_df=tuning_data,
-                label_columns=self._label_column,
-                problem_type=self._problem_type,
-                provided_column_types=column_types,
-            )
+        column_types, problem_type, output_shape = infer_column_problem_types(
+            train_df=train_data,
+            valid_df=tuning_data,
+            label_columns=self._label_column,
+            problem_type=self._problem_type,
+            provided_column_types=column_types,
+        )
 
         logger.debug(f"column_types: {column_types}")
         logger.debug(f"image columns: {[k for k, v in column_types.items() if v == 'image_path']}")
@@ -319,75 +412,24 @@ class AutoMMPredictor:
             column_types = self._column_types
 
         if self._problem_type is not None:
-            assert self._problem_type == problem_type, \
-                f"Inferred problem type {problem_type} is different from " \
-                f"the previous {self._problem_type}"
+            assert self._problem_type == problem_type, (
+                f"Inferred problem type {problem_type} is different from " f"the previous {self._problem_type}"
+            )
 
         if self._output_shape is not None:
-            assert self._output_shape == output_shape, \
-                f"Inferred output shape {output_shape} is different from " \
-                f"the previous {self._output_shape}"
-
-        if self._df_preprocessor is None:
-            df_preprocessor = init_df_preprocessor(
-                config=config.data,
-                column_types=column_types,
-                label_column=self._label_column,
-                train_df_x=train_data.drop(columns=self._label_column),
-                train_df_y=train_data[self._label_column]
+            assert self._output_shape == output_shape, (
+                f"Inferred output shape {output_shape} is different from " f"the previous {self._output_shape}"
             )
-        else:  # continuing training
-            df_preprocessor = self._df_preprocessor
-
-        config = select_model(
-            config=config,
-            df_preprocessor=df_preprocessor
-        )
-
-        if self._data_processors is None:
-            data_processors = init_data_processors(
-                config=config,
-                num_categorical_columns=len(df_preprocessor.categorical_num_categories)
-            )
-        else:  # continuing training
-            data_processors = self._data_processors
-
-        data_processors_count = {k: len(v) for k, v in data_processors.items()}
-        logger.debug(f"data_processors_count: {data_processors_count}")
-
-        if self._model is None:
-            model = create_model(
-                config=config,
-                num_classes=output_shape,
-                num_numerical_columns=len(df_preprocessor.numerical_feature_names),
-                num_categories=df_preprocessor.categorical_num_categories
-            )
-        else:  # continuing training
-            model = self._model
 
         if self._validation_metric_name is None or self._eval_metric_name is None:
             validation_metric_name, eval_metric_name = infer_metrics(
                 problem_type=problem_type,
                 eval_metric_name=self._eval_metric_name,
             )
-            if self._eval_metric_name is not None:
-                assert self._eval_metric_name == eval_metric_name, \
-                    f"Inferred evaluation metric {eval_metric_name} is different from " \
-                    f"the previous {self._eval_metric_name}"
-            if self._validation_metric_name is not None:
-                assert self._validation_metric_name == validation_metric_name, \
-                    f"Inferred validation metric {validation_metric_name} is different from " \
-                    f"the previous {self._validation_metric_name}"
         else:
             validation_metric_name = self._validation_metric_name
             eval_metric_name = self._eval_metric_name
-
-        validation_metric, minmax_mode, custom_metric_func = get_metric(
-            metric_name=validation_metric_name,
-            num_classes=output_shape,
-        )
-
-        loss_func = get_loss_func(problem_type)
+        minmax_mode = get_minmax_mode(validation_metric_name)
 
         if time_limit is not None:
             time_limit = timedelta(seconds=time_limit)
@@ -397,56 +439,156 @@ class AutoMMPredictor:
         self._eval_metric_name = eval_metric_name  # In case eval_metric isn't provided in __init__().
         self._validation_metric_name = validation_metric_name
         self._save_path = save_path
-        self._config = config
         self._output_shape = output_shape
         self._column_types = column_types
-        self._df_preprocessor = df_preprocessor
-        self._data_processors = data_processors
-        self._model = model
 
-        # save artifacts for the current running, except for model checkpoint, which will be saved in _fit()
-        self.save(save_path)
-
-        # need to assign the above attributes before setting up distillation
-        if teacher_predictor is not None:
-            teacher_model, critics, baseline_funcs, soft_label_loss_func, \
-                teacher_df_preprocessor, teacher_data_processors = \
-                self._setup_distillation(
-                    teacher_predictor=teacher_predictor,
-                )
-        else:
-            teacher_model, critics, baseline_funcs, soft_label_loss_func,\
-                teacher_df_preprocessor, teacher_data_processors = None, None, None, None, None, None
-
-        self._fit(
+        _fit_args = dict(
             train_df=train_data,
             val_df=tuning_data,
-            df_preprocessor=df_preprocessor,
-            data_processors=data_processors,
-            model=model,
-            config=config,
-            loss_func=loss_func,
-            validation_metric=validation_metric,
             validation_metric_name=validation_metric_name,
-            custom_metric_func=custom_metric_func,
             minmax_mode=minmax_mode,
-            teacher_model=teacher_model,
-            critics=critics,
-            baseline_funcs=baseline_funcs,
-            soft_label_loss_func=soft_label_loss_func,
-            teacher_df_preprocessor=teacher_df_preprocessor,
-            teacher_data_processors=teacher_data_processors,
             max_time=time_limit,
             save_path=save_path,
-            ckpt_path=self._ckpt_path,
-            resume=self._resume,
-            enable_progress_bar=self._enable_progress_bar,
+            ckpt_path=None if hyperparameter_tune_kwargs is not None else self._ckpt_path,
+            resume=False if hyperparameter_tune_kwargs is not None else self._resume,
+            enable_progress_bar=False if hyperparameter_tune_kwargs is not None else self._enable_progress_bar,
+            config=config,
+            hyperparameters=hyperparameters,
+            teacher_predictor=teacher_predictor,
+            hpo_mode=(hyperparameter_tune_kwargs is not None),  # skip average checkpoint if in hpo mode
         )
+
+        if hyperparameter_tune_kwargs is not None:
+            # TODO: allow custom gpu
+            resources = dict(num_gpus=torch.cuda.device_count())
+            if _fit_args["max_time"] is not None:
+                _fit_args["max_time"] *= 0.95  # give some buffer time to ray lightning trainer
+            predictor = self._hyperparameter_tune(
+                hyperparameter_tune_kwargs=hyperparameter_tune_kwargs,
+                resources=resources,
+                **_fit_args,
+            )
+            return predictor
+
+        self._fit(**_fit_args)
         return self
 
+    def _hyperparameter_tune(self, hyperparameter_tune_kwargs, resources, **_fit_args):
+        from autogluon.core.hpo import (
+            run,
+            cleanup_trials,
+            cleanup_checkpoints,
+            EmptySearchSpace,
+            AutommRayTuneAdapter,
+        )
+
+        search_space = _fit_args.get("hyperparameters", dict())
+        metric = "val_" + _fit_args.get("validation_metric_name")
+        mode = _fit_args.get("minmax_mode")
+        save_path = _fit_args.get("save_path")
+        time_budget_s = _fit_args.get("max_time")
+        is_distill = False
+        if _fit_args.get("teacher_predictor", None) is not None:
+            is_distill = True
+        try:
+            analysis = run(
+                trainable=self._hpo_fit_wrapper,
+                trainable_args=_fit_args,
+                search_space=search_space,
+                hyperparameter_tune_kwargs=hyperparameter_tune_kwargs,
+                metric=metric,
+                mode=mode,
+                save_dir=save_path,
+                ray_tune_adapter=AutommRayTuneAdapter(),
+                total_resources=resources,
+                time_budget_s=time_budget_s,
+                keep_checkpoints_num=3,  # TODO: find a way to extract this from config. Might need to separate generate config and trial specific config
+                checkpoint_score_attr=metric,
+                verbose=2,
+            )
+        except EmptySearchSpace:
+            raise ValueError(
+                "Please provide a search space using `hyperparameters` in order to do hyperparameter tune"
+            )
+        except Exception as e:
+            raise e
+        else:
+            # find the best trial
+            best_trial = analysis.get_best_trial(
+                metric=metric,
+                mode=mode,
+            )
+            if best_trial is None:
+                raise ValueError(
+                    "AutoMMPredictor wasn't able to find the best trial."
+                    "Either all trials failed or"
+                    "it's likely that the time is not enough to train a single epoch for trials."
+                )
+            # clean up other trials
+            logger.info("Removing non-optimal trials and only keep the best one.")
+            cleanup_trials(save_path, best_trial.trial_id)
+            best_trial_path = os.path.join(save_path, best_trial.trial_id)
+            # reload the predictor metadata
+            predictor = AutoMMPredictor._load_metadata(predictor=self, path=best_trial_path)
+            # construct the model
+            model = create_model(
+                config=predictor._config,
+                num_classes=predictor._output_shape,
+                num_numerical_columns=len(predictor._df_preprocessor.numerical_feature_names),
+                num_categories=predictor._df_preprocessor.categorical_num_categories,
+                pretrained=False,  # set "pretrain=False" to prevent downloading online models
+            )
+            predictor._model = model
+            # average checkpoint
+            checkpoints_paths_and_scores = dict(
+                (os.path.join(checkpoint, RAY_TUNE_CHECKPOINT), score)
+                for checkpoint, score in analysis.get_trial_checkpoints_paths(best_trial, metric=metric)
+            )
+            # write checkpoint paths and scores to yaml file so that top_k_average could read it
+            best_k_model_path = os.path.join(best_trial_path, BEST_K_MODELS_FILE)
+            with open(best_k_model_path, "w") as yaml_file:
+                yaml.dump(checkpoints_paths_and_scores, yaml_file, default_flow_style=False)
+
+            last_ckpt_path = analysis.get_last_checkpoint(best_trial)
+            predictor._top_k_average(
+                model=predictor._model,
+                save_path=best_trial_path,
+                last_ckpt_path=last_ckpt_path,
+                minmax_mode=mode,
+                is_distill=is_distill,
+                top_k_average_method=predictor._config.optimization.top_k_average_method,
+                val_df=_fit_args["val_df"],
+                validation_metric_name=predictor._validation_metric_name,
+            )
+            cleanup_checkpoints(best_trial_path)
+            # move trial predictor one level up
+            contents = os.listdir(best_trial_path)
+            for content in contents:
+                shutil.move(
+                    os.path.join(best_trial_path, content),
+                    os.path.join(save_path, content),
+                )
+            shutil.rmtree(best_trial_path)
+            predictor._save_path = save_path
+
+            return predictor
+
+    def _hpo_fit_wrapper(self, sampled_hyperparameters, checkpoint_dir=None, **_fit_args):
+        from ray import tune
+
+        _fit_args[
+            "hyperparameters"
+        ] = sampled_hyperparameters  # The original hyperparameters is the search space, replace it with the hyperparameters sampled
+        _fit_args["save_path"] = tune.get_trial_dir()  # We want to save each trial to a separate directory
+        logger.debug(f"hpo trial save_path: {_fit_args['save_path']}")
+        if checkpoint_dir is not None:
+            _fit_args["resume"] = True
+            _fit_args["ckpt_path"] = os.path.join(checkpoint_dir, RAY_TUNE_CHECKPOINT)
+        self._fit(**_fit_args)
+
     def _setup_distillation(
-            self,
-            teacher_predictor: Union[str, AutoMMPredictor],
+        self,
+        teacher_predictor: Union[str, AutoMMPredictor],
     ):
         """
         Prepare for distillation. It verifies whether the student and teacher predictors have consistent
@@ -497,16 +639,22 @@ class AutoMMPredictor:
         elif self._config.distiller.soft_label_loss_type == "cross_entropy":
             soft_label_loss_func = nn.CrossEntropyLoss()
         else:
-            raise ValueError(
-                f"Unknown soft_label_loss_type: {self._config.distiller.soft_label_loss_type}"
-            )
+            raise ValueError(f"Unknown soft_label_loss_type: {self._config.distiller.soft_label_loss_type}")
+
+        # turn on returning column information in data processors
+        self._data_processors = turn_on_off_feature_column_info(
+            data_processors=self._data_processors,
+            flag=True,
+        )
+        teacher_predictor._data_processors = turn_on_off_feature_column_info(
+            data_processors=teacher_predictor._data_processors,
+            flag=True,
+        )
 
         logger.debug(
             f"teacher preprocessor text_feature_names: {teacher_predictor._df_preprocessor._text_feature_names}"
         )
-        logger.debug(
-            f"teacher preprocessor image_path_names: {teacher_predictor._df_preprocessor._image_path_names}"
-        )
+        logger.debug(f"teacher preprocessor image_path_names: {teacher_predictor._df_preprocessor._image_path_names}")
         logger.debug(
             f"teacher preprocessor categorical_feature_names: {teacher_predictor._df_preprocessor._categorical_feature_names}"
         )
@@ -514,18 +662,12 @@ class AutoMMPredictor:
             f"teacher preprocessor numerical_feature_names: {teacher_predictor._df_preprocessor._numerical_feature_names}"
         )
 
-        logger.debug(
-            f"student preprocessor text_feature_names: {self._df_preprocessor._text_feature_names}"
-        )
-        logger.debug(
-            f"student preprocessor image_path_names: {self._df_preprocessor._image_path_names}"
-        )
+        logger.debug(f"student preprocessor text_feature_names: {self._df_preprocessor._text_feature_names}")
+        logger.debug(f"student preprocessor image_path_names: {self._df_preprocessor._image_path_names}")
         logger.debug(
             f"student preprocessor categorical_feature_names: {self._df_preprocessor._categorical_feature_names}"
         )
-        logger.debug(
-            f"student preprocessor numerical_feature_names: {self._df_preprocessor._numerical_feature_names}"
-        )
+        logger.debug(f"student preprocessor numerical_feature_names: {self._df_preprocessor._numerical_feature_names}")
 
         return (
             teacher_predictor._model,
@@ -537,30 +679,153 @@ class AutoMMPredictor:
         )
 
     def _fit(
-            self,
-            train_df: pd.DataFrame,
-            val_df: pd.DataFrame,
-            df_preprocessor: MultiModalFeaturePreprocessor,
-            data_processors: dict,
-            model: nn.Module,
-            config: DictConfig,
-            loss_func: _Loss,
-            validation_metric: torchmetrics.Metric,
-            validation_metric_name: str,
-            custom_metric_func: Callable,
-            minmax_mode: str,
-            teacher_model: nn.Module,
-            critics: nn.ModuleList,
-            baseline_funcs: nn.ModuleList,
-            soft_label_loss_func: _Loss,
-            teacher_df_preprocessor: MultiModalFeaturePreprocessor,
-            teacher_data_processors: dict,
-            max_time: timedelta,
-            save_path: str,
-            ckpt_path: str,
-            resume: bool,
-            enable_progress_bar: bool,
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        validation_metric_name: str,
+        minmax_mode: str,
+        max_time: timedelta,
+        save_path: str,
+        ckpt_path: str,
+        resume: bool,
+        enable_progress_bar: bool,
+        config: Optional[dict] = None,
+        hyperparameters: Optional[Union[str, Dict, List[str]]] = None,
+        teacher_predictor: Union[str, AutoMMPredictor] = None,
+        hpo_mode: bool = False,
+        **hpo_kwargs,
     ):
+        if self._config is not None:  # continuous training
+            config = self._config
+
+        config = get_config(
+            config=config,
+            overrides=hyperparameters,
+        )
+
+        config = update_config_by_rules(
+            problem_type=self._problem_type,
+            config=config,
+        )
+
+        if self._df_preprocessor is None:
+            df_preprocessor = init_df_preprocessor(
+                config=config.data,
+                column_types=self._column_types,
+                label_column=self._label_column,
+                train_df_x=train_df.drop(columns=self._label_column),
+                train_df_y=train_df[self._label_column],
+            )
+        else:  # continuing training
+            df_preprocessor = self._df_preprocessor
+
+        config = select_model(config=config, df_preprocessor=df_preprocessor)
+
+        if self._data_processors is None:
+            data_processors = init_data_processors(
+                config=config,
+                df_preprocessor=df_preprocessor,
+            )
+        else:  # continuing training
+            data_processors = self._data_processors
+
+        data_processors_count = {k: len(v) for k, v in data_processors.items()}
+        logger.debug(f"data_processors_count: {data_processors_count}")
+
+        if self._model is None:
+            model = create_model(
+                config=config,
+                num_classes=self._output_shape,
+                num_numerical_columns=len(df_preprocessor.numerical_feature_names),
+                num_categories=df_preprocessor.categorical_num_categories,
+            )
+        else:  # continuing training
+            model = self._model
+
+        pos_label = try_to_infer_pos_label(
+            data_config=config.data,
+            label_encoder=df_preprocessor.label_generator,
+            problem_type=self._problem_type,
+        )
+        validation_metric, custom_metric_func = get_metric(
+            metric_name=validation_metric_name,
+            problem_type=self._problem_type,
+            num_classes=self._output_shape,
+            pos_label=pos_label,
+        )
+
+        mixup_active, mixup_fn = get_mixup(
+            model_config=OmegaConf.select(config, "model"),
+            mixup_config=OmegaConf.select(config, "data.mixup"),
+            num_classes=self._output_shape,
+        )
+        if mixup_active and (config.env.per_gpu_batch_size == 1 or config.env.per_gpu_batch_size % 2 == 1):
+            warnings.warn(
+                "The mixup is done on the batch."
+                "The per_gpu_batch_size should be >1 and even for reasonable operation",
+                UserWarning,
+            )
+
+        loss_func = get_loss_func(
+            self._problem_type,
+            mixup_active,
+            OmegaConf.select(config, "optimization.loss_function"),
+        )
+
+        self._config = config
+        self._df_preprocessor = df_preprocessor
+        self._data_processors = data_processors
+        self._model = model
+        self._loss_func = loss_func
+
+        # save artifacts for the current running, except for model checkpoint, which will be saved in trainer
+        self.save(save_path)
+
+        if hasattr(config, MATCHER):
+            warnings.warn("Matching is experimental. We may change its behaviors in future.", UserWarning)
+            match_label = self._df_preprocessor.label_generator.transform([self._config.matcher.match_label]).item()
+            data_processors = turn_on_off_feature_column_info(
+                data_processors=data_processors,
+                flag=True,
+            )
+        else:
+            match_label = None
+
+        if max_time == timedelta(seconds=0):
+            self._top_k_average(
+                model=model,
+                save_path=save_path,
+                minmax_mode=minmax_mode,
+                is_distill=False,
+                top_k_average_method=config.optimization.top_k_average_method,
+                val_df=val_df,
+                validation_metric_name=validation_metric_name,
+            )
+
+            return self
+
+        # need to assign the above attributes before setting up distillation
+        if teacher_predictor is not None:
+            (
+                teacher_model,
+                critics,
+                baseline_funcs,
+                soft_label_loss_func,
+                teacher_df_preprocessor,
+                teacher_data_processors,
+            ) = self._setup_distillation(
+                teacher_predictor=teacher_predictor,
+            )
+        else:
+            (
+                teacher_model,
+                critics,
+                baseline_funcs,
+                soft_label_loss_func,
+                teacher_df_preprocessor,
+                teacher_data_processors,
+            ) = (None, None, None, None, None, None)
+
         if teacher_df_preprocessor is not None:
             df_preprocessor = [df_preprocessor, teacher_df_preprocessor]
         if teacher_data_processors is not None:
@@ -591,6 +856,8 @@ class AutoMMPredictor:
             custom_metric_func=custom_metric_func,
         )
         is_distill = teacher_model is not None
+        is_match = hasattr(config, MATCHER)
+        assert not (is_distill and is_match), "Can't do distillation and matching simultaneously"
         if is_distill:
             task = DistillerLitModule(
                 student_model=model,
@@ -606,11 +873,21 @@ class AutoMMPredictor:
                 **metrics_kwargs,
                 **optimization_kwargs,
             )
+        elif is_match:
+            task = MatcherLitModule(
+                model=model,
+                matches=config.matcher.matches,
+                match_label=match_label,
+                **metrics_kwargs,
+                **optimization_kwargs,
+            )
         else:
             task = LitModule(
                 model=model,
                 loss_func=loss_func,
-                efficient_finetune=OmegaConf.select(config, 'optimization.efficient_finetune'),
+                efficient_finetune=OmegaConf.select(config, "optimization.efficient_finetune"),
+                mixup_fn=mixup_fn,
+                mixup_off_epoch=OmegaConf.select(config, "data.mixup.mixup_off_epoch"),
                 **metrics_kwargs,
                 **optimization_kwargs,
             )
@@ -618,7 +895,7 @@ class AutoMMPredictor:
         logger.debug(f"validation_metric_name: {task.validation_metric_name}")
         logger.debug(f"minmax_mode: {minmax_mode}")
 
-        checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        checkpoint_callback = AutoMMModelCheckpoint(
             dirpath=save_path,
             save_top_k=config.optimization.top_k,
             verbose=True,
@@ -629,11 +906,30 @@ class AutoMMPredictor:
         early_stopping_callback = pl.callbacks.EarlyStopping(
             monitor=task.validation_metric_name,
             patience=config.optimization.patience,
-            mode=minmax_mode
+            mode=minmax_mode,
         )
         lr_callback = pl.callbacks.LearningRateMonitor(logging_interval="step")
         model_summary = pl.callbacks.ModelSummary(max_depth=1)
-        callbacks = [checkpoint_callback, early_stopping_callback, lr_callback, model_summary]
+        callbacks = [
+            checkpoint_callback,
+            early_stopping_callback,
+            lr_callback,
+            model_summary,
+        ]
+
+        if hpo_mode:
+            from ray_lightning.tune import TuneReportCheckpointCallback
+
+            tune_report_callback = TuneReportCheckpointCallback(
+                {f"{task.validation_metric_name}": f"{task.validation_metric_name}"},
+                filename=RAY_TUNE_CHECKPOINT,
+            )
+            callbacks = [
+                tune_report_callback,
+                early_stopping_callback,
+                lr_callback,
+                model_summary,
+            ]
 
         tb_logger = pl.loggers.TensorBoardLogger(
             save_dir=save_path,
@@ -641,11 +937,7 @@ class AutoMMPredictor:
             version="",
         )
 
-        num_gpus = (
-            config.env.num_gpus
-            if isinstance(config.env.num_gpus, int)
-            else len(config.env.num_gpus)
-        )
+        num_gpus = config.env.num_gpus if isinstance(config.env.num_gpus, int) else len(config.env.num_gpus)
         if num_gpus < 0:  # In case config.env.num_gpus is -1, meaning using all gpus.
             num_gpus = torch.cuda.device_count()
 
@@ -657,34 +949,42 @@ class AutoMMPredictor:
                 "Consider to switch to an instance with GPU support.",
                 UserWarning,
             )
-            grad_steps = max(config.env.batch_size // (
-                    config.env.per_gpu_batch_size * config.env.num_nodes
-            ), 1)
+            grad_steps = max(
+                config.env.batch_size // (config.env.per_gpu_batch_size * config.env.num_nodes),
+                1,
+            )
             precision = 32  # Force to use fp32 for training since fp16-based AMP is not available in CPU.
-                            # Try to check the status of bf16 training later.
+            # Try to check the status of bf16 training later.
         else:
-            grad_steps = max(config.env.batch_size // (
-                    config.env.per_gpu_batch_size * num_gpus * config.env.num_nodes
-            ), 1)
+            grad_steps = max(
+                config.env.batch_size // (config.env.per_gpu_batch_size * num_gpus * config.env.num_nodes),
+                1,
+            )
             precision = config.env.precision
 
-            if precision == 'bf16' and not torch.cuda.is_bf16_supported():
-                warnings.warn('bf16 is not supported by the GPU device / cuda version. '
-                              'Consider to use GPU devices with version after Amphere (e.g., available as AWS P4 instances) '
-                              'and upgrade cuda to be >=11.0. '
-                              'Currently, AutoGluon will downgrade the precision to 32.', UserWarning)
+            if precision == "bf16" and not torch.cuda.is_bf16_supported():
+                warnings.warn(
+                    "bf16 is not supported by the GPU device / cuda version. "
+                    "Consider to use GPU devices with version after Amphere (e.g., available as AWS P4 instances) "
+                    "and upgrade cuda to be >=11.0. "
+                    "Currently, AutoGluon will downgrade the precision to 32.",
+                    UserWarning,
+                )
                 precision = 32
 
-        if num_gpus <= 1:
-            strategy = None
+        if not hpo_mode:
+            if num_gpus <= 1:
+                strategy = None
+            else:
+                strategy = config.env.strategy
         else:
-            strategy = config.env.strategy
+            strategy = hpo_kwargs.get("_ray_lightning_plugin")
 
         blacklist_msgs = ["already configured with model summary"]
         log_filter = LogFilter(blacklist_msgs)
         with apply_log_filter(log_filter):
             trainer = pl.Trainer(
-                gpus=num_gpus,
+                gpus=num_gpus if not hpo_mode else None,  # ray lightning requires not specifying gpus
                 auto_select_gpus=config.env.auto_select_gpus if num_gpus != 0 else False,
                 num_nodes=config.env.num_nodes,
                 precision=precision,
@@ -710,12 +1010,9 @@ class AutoMMPredictor:
                 "ignore",
                 ".*does not have many workers which may be a bottleneck. "
                 "Consider increasing the value of the `num_workers` argument` "
-                ".* in the `DataLoader` init to improve performance.*"
+                ".* in the `DataLoader` init to improve performance.*",
             )
-            warnings.filterwarnings(
-                "ignore",
-                "Checkpoint directory .* exists and is not empty."
-            )
+            warnings.filterwarnings("ignore", "Checkpoint directory .* exists and is not empty.")
             trainer.fit(
                 task,
                 datamodule=train_dm,
@@ -723,109 +1020,107 @@ class AutoMMPredictor:
             )
 
         if trainer.global_rank == 0:
-            self._top_k_average(
-                model=model,
-                save_path=save_path,
-                checkpoint_callback=checkpoint_callback,
-                minmax_mode=minmax_mode,
-                is_distill=is_distill,
-                config=config,
-                val_df=val_df,
-                validation_metric_name=validation_metric_name,
-            )
+            # We do not perform averaging checkpoint in the case of hpo for each trial
+            # We only averaging the checkpoint of the best trial in the end in the master process
+            if not hpo_mode:
+                self._top_k_average(
+                    model=model,
+                    save_path=save_path,
+                    minmax_mode=minmax_mode,
+                    is_distill=is_distill,
+                    top_k_average_method=config.optimization.top_k_average_method,
+                    val_df=val_df,
+                    validation_metric_name=validation_metric_name,
+                )
         else:
-            sys.exit(
-                f"Training finished, exit the process with global_rank={trainer.global_rank}..."
-            )
+            sys.exit(f"Training finished, exit the process with global_rank={trainer.global_rank}...")
 
     def _top_k_average(
-            self,
-            model,
-            save_path,
-            checkpoint_callback,
-            minmax_mode,
-            is_distill,
-            config,
-            val_df,
-            validation_metric_name,
+        self,
+        model,
+        save_path,
+        minmax_mode,
+        is_distill,
+        top_k_average_method,
+        val_df,
+        validation_metric_name,
+        last_ckpt_path=None,
     ):
+        best_k_models_yaml_path = os.path.join(save_path, BEST_K_MODELS_FILE)
+        if os.path.exists(best_k_models_yaml_path):
+            with open(best_k_models_yaml_path, "r") as f:
+                best_k_models = yaml.load(f, Loader=yaml.Loader)
+        else:
+            # In some cases, the training ends up too early (e.g., due to time_limit) so that there is
+            # no saved best_k model checkpoints. In that scenario, we won't perform any model averaging.
+            best_k_models = None
+        if last_ckpt_path is None:
+            last_ckpt_path = os.path.join(save_path, LAST_CHECKPOINT)
 
-        top_k_model_paths = checkpoint_callback.best_k_models.keys()
         if is_distill:
             prefix = "student_model."
         else:
             prefix = "model."
 
-        if config.optimization.top_k_average_method == UNIFORM_SOUP:
-            logger.info(
-                f"Start to fuse {len(checkpoint_callback.best_k_models)} checkpoints via the uniform soup algorithm."
-            )
-            ingredients = top_k_model_paths
-        else:
-            # In the case of ddp_spawn, the checkpoint_callback.best_k_models.values() can be empty. This is due the
-            # limitation of PT Lightning: https://github.com/PyTorchLightning/pytorch-lightning/issues/5582
-            # Thus, we will need to reevaluate the validation performance of these checkpoints
-            logger.info(
-                f"Evaluate {len(checkpoint_callback.best_k_models)} checkpoints and "
-                f"sort them in a decreasing order based on their performances."
-            )
-            top_k_model_scores = []
-            for per_model_path in top_k_model_paths:
-                self._model = self._load_state_dict(
-                    model=model,
-                    path=per_model_path,
-                    prefix=prefix,
-                )
-                top_k_model_scores.append(
-                    self.evaluate(val_df, [validation_metric_name])[validation_metric_name]
-                )
-
-            top_k_model_paths = [
-                v[0] for v in sorted(
-                    zip(top_k_model_paths, top_k_model_scores),
-                    key=lambda ele: ele[1],
-                    reverse=(minmax_mode == MAX),
-                )
-            ]
-            if config.optimization.top_k_average_method == GREEDY_SOUP:
-                # Select the ingredients based on the methods proposed in paper
-                #  "Model soups: averaging weights of multiple fine-tuned models improves accuracy without
-                #  increasing inference time", https://arxiv.org/pdf/2203.05482.pdf
-                monitor_op = {MIN: operator.le, MAX: operator.ge}[minmax_mode]
-
-                logger.info(
-                    f"Start to fuse {len(top_k_model_paths)} checkpoints via the greedy soup algorithm."
-                )
-
-                ingredients = [top_k_model_paths[0]]
-                self._model = self._load_state_dict(
-                    model=model,
-                    path=top_k_model_paths[0],
-                    prefix=prefix,
-                )
-                best_score = self.evaluate(val_df, [validation_metric_name])[validation_metric_name]
-                for i in range(1, len(top_k_model_paths)):
-                    cand_avg_state_dict = average_checkpoints(
-                        checkpoint_paths=ingredients + [top_k_model_paths[i]],
+        if best_k_models:
+            if top_k_average_method == UNIFORM_SOUP:
+                logger.info(f"Start to fuse {len(best_k_models)} checkpoints via the uniform soup algorithm.")
+                ingredients = top_k_model_paths = list(best_k_models.keys())
+            else:
+                top_k_model_paths = [
+                    v[0]
+                    for v in sorted(
+                        list(best_k_models.items()),
+                        key=lambda ele: ele[1],
+                        reverse=(minmax_mode == MAX),
                     )
+                ]
+                if top_k_average_method == GREEDY_SOUP:
+                    # Select the ingredients based on the methods proposed in paper
+                    #  "Model soups: averaging weights of multiple fine-tuned models improves accuracy without
+                    #  increasing inference time", https://arxiv.org/pdf/2203.05482.pdf
+                    monitor_op = {MIN: operator.le, MAX: operator.ge}[minmax_mode]
+
+                    logger.info(f"Start to fuse {len(top_k_model_paths)} checkpoints via the greedy soup algorithm.")
+
+                    ingredients = [top_k_model_paths[0]]
                     self._model = self._load_state_dict(
-                        model=self._model,
-                        state_dict=cand_avg_state_dict,
+                        model=model,
+                        path=top_k_model_paths[0],
                         prefix=prefix,
                     )
-                    cand_score = self.evaluate(val_df, [validation_metric_name])[validation_metric_name]
-                    if monitor_op(cand_score, best_score):
-                        # Add new ingredient
-                        ingredients.append(top_k_model_paths[i])
-                        best_performance = cand_score
-            elif config.optimization.top_k_average_method == BEST:
-                ingredients = [top_k_model_paths[0]]
-            else:
-                raise ValueError(
-                    f"The key for 'optimization.top_k_average_method' is not supported. "
-                    f"We only support '{GREEDY_SOUP}', '{UNIFORM_SOUP}' and '{BEST}'. "
-                    f"The provided value is '{config.optimization.top_k_average_method}'."
-                )
+                    best_score = self.evaluate(val_df, [validation_metric_name])[validation_metric_name]
+                    for i in range(1, len(top_k_model_paths)):
+                        cand_avg_state_dict = average_checkpoints(
+                            checkpoint_paths=ingredients + [top_k_model_paths[i]],
+                        )
+                        self._model = self._load_state_dict(
+                            model=self._model,
+                            state_dict=cand_avg_state_dict,
+                            prefix=prefix,
+                        )
+                        cand_score = self.evaluate(val_df, [validation_metric_name])[validation_metric_name]
+                        if monitor_op(cand_score, best_score):
+                            # Add new ingredient
+                            ingredients.append(top_k_model_paths[i])
+                            best_score = cand_score
+                elif top_k_average_method == BEST:
+                    ingredients = [top_k_model_paths[0]]
+                else:
+                    raise ValueError(
+                        f"The key for 'optimization.top_k_average_method' is not supported. "
+                        f"We only support '{GREEDY_SOUP}', '{UNIFORM_SOUP}' and '{BEST}'. "
+                        f"The provided value is '{top_k_average_method}'."
+                    )
+        else:
+            # best_k_models is empty so we will manually save a checkpoint from the trainer
+            # and use it as the main ingredients
+            ingredients = [last_ckpt_path]
+            top_k_model_paths = []
+            # no checkpoints are available, do nothing
+            if not os.path.isfile(last_ckpt_path):
+                return
+
         # Average all the ingredients
         avg_state_dict = average_checkpoints(
             checkpoint_paths=ingredients,
@@ -843,17 +1138,24 @@ class AutoMMPredictor:
                 new_prefix="model",
             )
         checkpoint = {"state_dict": avg_state_dict}
-        torch.save(checkpoint, os.path.join(save_path, "model.ckpt"))
+        torch.save(checkpoint, os.path.join(save_path, MODEL_CHECKPOINT))
 
-        # clean old checkpoints
+        # clean old checkpoints + the intermediate files stored
         for per_path in top_k_model_paths:
-            os.remove(per_path)
+            if os.path.isfile(per_path):
+                os.remove(per_path)
+        # remove the yaml file after cleaning the checkpoints
+        if os.path.isfile(best_k_models_yaml_path):
+            os.remove(best_k_models_yaml_path)
+        # clean the last checkpoint
+        if os.path.isfile(last_ckpt_path):
+            os.remove(last_ckpt_path)
 
     def _predict(
-            self,
-            data: Union[pd.DataFrame, dict, list],
-            ret_type: str,
-            requires_label: bool,
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        ret_type: str,
+        requires_label: bool,
     ) -> torch.Tensor:
 
         data = self._data_to_df(data)
@@ -866,9 +1168,7 @@ class AutoMMPredictor:
             data_processors = self._data_processors
 
         num_gpus = (
-            self._config.env.num_gpus
-            if isinstance(self._config.env.num_gpus, int)
-            else len(self._config.env.num_gpus)
+            self._config.env.num_gpus if isinstance(self._config.env.num_gpus, int) else len(self._config.env.num_gpus)
         )
         if num_gpus < 0:
             num_gpus = torch.cuda.device_count()
@@ -884,21 +1184,33 @@ class AutoMMPredictor:
             precision = 32  # Force to use fp32 for training since fp16-based AMP is not available in CPU
         else:
             precision = self._config.env.precision
-            if precision == 'bf16' and not torch.cuda.is_bf16_supported():
-                warnings.warn('bf16 is not supported by the GPU device / cuda version. '
-                              'Consider to use GPU devices with version after Amphere or upgrade cuda to be >=11.0. '
-                              'Currently, AutoGluon will downgrade the precision to 32.', UserWarning)
+            if precision == "bf16" and not torch.cuda.is_bf16_supported():
+                warnings.warn(
+                    "bf16 is not supported by the GPU device / cuda version. "
+                    "Consider to use GPU devices with version after Amphere or upgrade cuda to be >=11.0. "
+                    "Currently, AutoGluon will downgrade the precision to 32.",
+                    UserWarning,
+                )
                 precision = 32
+
+        if self._config.env.per_gpu_batch_size_evaluation:
+            batch_size = self._config.env.per_gpu_batch_size_evaluation
+        else:
+            batch_size = self._config.env.per_gpu_batch_size * self._config.env.eval_batch_size_ratio
 
         if num_gpus > 1:
             strategy = "dp"
             # If using 'dp', the per_gpu_batch_size would be split by all GPUs.
             # So, we need to use the GPU number as a multiplier to compute the batch size.
-            batch_size = self._config.env.per_gpu_batch_size_evaluation * num_gpus
+            batch_size = batch_size * num_gpus
         else:
             strategy = None
-            batch_size = self._config.env.per_gpu_batch_size_evaluation
 
+        if hasattr(self._config, MATCHER):
+            data_processors = turn_on_off_feature_column_info(
+                data_processors=data_processors,
+                flag=True,
+            )
         predict_dm = BaseDataModule(
             df_preprocessor=self._df_preprocessor,
             data_processors=data_processors,
@@ -906,9 +1218,17 @@ class AutoMMPredictor:
             num_workers=self._config.env.num_workers_evaluation,
             predict_data=data,
         )
-        task = LitModule(
-            model=self._model,
-        )
+        if hasattr(self._config, MATCHER):
+            match_label = self._df_preprocessor.label_generator.transform([self._config.matcher.match_label]).item()
+            task = MatcherLitModule(
+                model=self._model,
+                matches=self._config.matcher.matches,
+                match_label=match_label,
+            )
+        else:
+            task = LitModule(
+                model=self._model,
+            )
 
         blacklist_msgs = []
         if self._verbosity <= 3:  # turn off logging in prediction
@@ -936,7 +1256,7 @@ class AutoMMPredictor:
                     "ignore",
                     ".*does not have many workers which may be a bottleneck. "
                     "Consider increasing the value of the `num_workers` argument` "
-                    ".* in the `DataLoader` init to improve performance.*"
+                    ".* in the `DataLoader` init to improve performance.*",
                 )
                 outputs = evaluator.predict(
                     task,
@@ -945,6 +1265,9 @@ class AutoMMPredictor:
         if ret_type == LOGITS:
             logits = [ele[LOGITS] for ele in outputs]
             ret = torch.cat(logits)
+        elif ret_type == PROBABILITY:
+            probability = [ele[PROBABILITY] for ele in outputs]
+            ret = torch.cat(probability)
         elif ret_type == FEATURES:
             features = [ele[FEATURES] for ele in outputs]
             ret = torch.cat(features)
@@ -961,10 +1284,10 @@ class AutoMMPredictor:
         return prob
 
     def evaluate(
-            self,
-            data: Union[pd.DataFrame, dict, list],
-            metrics: Optional[List[str]] = None,
-            return_pred: Optional[bool] = False,
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        metrics: Optional[List[str]] = None,
+        return_pred: Optional[bool] = False,
     ):
         """
         Evaluate model on a test dataset.
@@ -984,49 +1307,74 @@ class AutoMMPredictor:
         A dictionary with the metric names and their corresponding scores.
         Optionally return a dataframe of prediction results.
         """
-        logits = self._predict(
+        if hasattr(self._config, MATCHER):
+            ret_type = PROBABILITY
+        else:
+            ret_type = LOGITS
+
+        logits_or_prob = self._predict(
             data=data,
-            ret_type=LOGITS,
+            ret_type=ret_type,
             requires_label=True,
         )
         metric_data = {}
         if self._problem_type in [BINARY, MULTICLASS]:
-            y_pred_prob = self._logits_to_prob(logits)
+            if ret_type == LOGITS:
+                y_pred_prob = self._logits_to_prob(logits_or_prob)
+            else:
+                y_pred_prob = logits_or_prob.detach().cpu().float().numpy()
             metric_data[Y_PRED_PROB] = y_pred_prob
 
-        y_pred = self._df_preprocessor.transform_prediction(y_pred=logits, inverse_categorical=False)
-        y_pred_transformed = self._df_preprocessor.transform_prediction(y_pred=logits, inverse_categorical=True)
+        y_pred = self._df_preprocessor.transform_prediction(
+            y_pred=logits_or_prob,
+            inverse_categorical=False,
+            loss_func=self._loss_func if hasattr(self, "_loss_func") else None,
+        )
+        y_pred_inv = self._df_preprocessor.transform_prediction(
+            y_pred=logits_or_prob,
+            inverse_categorical=True,
+            loss_func=self._loss_func if hasattr(self, "_loss_func") else None,
+        )
         y_true = self._df_preprocessor.transform_label_for_metric(df=data)
 
-        metric_data.update({
-            Y_PRED: y_pred,
-            Y_TRUE: y_true,
-        })
+        metric_data.update(
+            {
+                Y_PRED: y_pred,
+                Y_TRUE: y_true,
+            }
+        )
 
         if metrics is None:
             metrics = [self._eval_metric_name]
 
         results = {}
         for per_metric in metrics:
-            if self._problem_type != BINARY and per_metric.lower() in ["roc_auc", "average_precision"]:
-                raise ValueError(
-                    f"Metric {per_metric} is only supported for binary classification."
-                )
+            if self._problem_type != BINARY and per_metric.lower() in [
+                "roc_auc",
+                "average_precision",
+            ]:
+                raise ValueError(f"Metric {per_metric} is only supported for binary classification.")
+            pos_label = try_to_infer_pos_label(
+                data_config=self._config.data,
+                label_encoder=self._df_preprocessor.label_generator,
+                problem_type=self._problem_type,
+            )
             score = compute_score(
                 metric_data=metric_data,
                 metric_name=per_metric.lower(),
+                pos_label=pos_label,
             )
             results[per_metric] = score
 
         if return_pred:
-            return results, self.as_pandas(data=data, to_be_converted=y_pred_transformed)
+            return results, self.as_pandas(data=data, to_be_converted=y_pred_inv)
         else:
             return results
 
     def predict(
-            self,
-            data: Union[pd.DataFrame, dict, list],
-            as_pandas: Optional[bool] = True,
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        as_pandas: Optional[bool] = True,
     ):
         """
         Predict values for the label column of new data.
@@ -1043,22 +1391,29 @@ class AutoMMPredictor:
         -------
         Array of predictions, one corresponding to each row in given dataset.
         """
+        if hasattr(self._config, MATCHER):
+            ret_type = PROBABILITY
+        else:
+            ret_type = LOGITS
 
-        logits = self._predict(
+        logits_or_prob = self._predict(
             data=data,
-            ret_type=LOGITS,
+            ret_type=ret_type,
             requires_label=False,
         )
-        pred = self._df_preprocessor.transform_prediction(y_pred=logits)
+        pred = self._df_preprocessor.transform_prediction(
+            y_pred=logits_or_prob,
+            loss_func=self._loss_func if hasattr(self, "_loss_func") else None,
+        )
         if as_pandas:
             pred = self.as_pandas(data=data, to_be_converted=pred)
         return pred
 
     def predict_proba(
-            self,
-            data: Union[pd.DataFrame, dict, list],
-            as_pandas: Optional[bool] = True,
-            as_multiclass: Optional[bool] = True,
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        as_pandas: Optional[bool] = True,
+        as_multiclass: Optional[bool] = True,
     ):
         """
         Predict probabilities class probabilities rather than class labels.
@@ -1081,27 +1436,43 @@ class AutoMMPredictor:
         When as_multiclass is True, the output will always have shape (#samples, #classes).
         Otherwise, the output will have shape (#samples,)
         """
-        assert self._problem_type in [BINARY, MULTICLASS], \
-            f"Problem {self._problem_type} has no probability output."
+        assert self._problem_type in [
+            BINARY,
+            MULTICLASS,
+        ], f"Problem {self._problem_type} has no probability output."
 
-        logits = self._predict(
+        if hasattr(self._config, MATCHER):
+            ret_type = PROBABILITY
+        else:
+            ret_type = LOGITS
+
+        logits_or_prob = self._predict(
             data=data,
-            ret_type=LOGITS,
+            ret_type=ret_type,
             requires_label=False,
         )
-        prob = self._logits_to_prob(logits)
+
+        if ret_type == LOGITS:
+            prob = self._logits_to_prob(logits_or_prob)
+        else:
+            prob = logits_or_prob.detach().cpu().float().numpy()
 
         if not as_multiclass:
             if self._problem_type == BINARY:
-                prob = prob[:, 1]
+                pos_label = try_to_infer_pos_label(
+                    data_config=self._config.data,
+                    label_encoder=self._df_preprocessor.label_generator,
+                    problem_type=self._problem_type,
+                )
+                prob = prob[:, pos_label]
         if as_pandas:
             prob = self.as_pandas(data=data, to_be_converted=prob)
         return prob
 
     def extract_embedding(
-            self,
-            data: Union[pd.DataFrame, dict, list],
-            as_pandas: Optional[bool] = False,
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        as_pandas: Optional[bool] = False,
     ):
         """
         Extract features for each sample, i.e., one row in the provided dataframe `data`.
@@ -1140,15 +1511,15 @@ class AutoMMPredictor:
             data = load_pd.load(data)
         else:
             raise NotImplementedError(
-                f'The format of data is not understood. '
+                f"The format of data is not understood. "
                 f'We have type(data)="{type(data)}", but a pd.DataFrame was required.'
             )
         return data
 
     def as_pandas(
-            self,
-            data: Union[pd.DataFrame, dict, list],
-            to_be_converted: np.ndarray,
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        to_be_converted: np.ndarray,
     ):
         if isinstance(data, pd.DataFrame):
             index = data.index
@@ -1161,23 +1532,22 @@ class AutoMMPredictor:
 
     @staticmethod
     def _load_state_dict(
-            model: nn.Module,
-            state_dict: dict = None,
-            path: str = None,
-            prefix: str = "model."
+        model: nn.Module,
+        state_dict: dict = None,
+        path: str = None,
+        prefix: str = "model.",
     ):
         if state_dict is None:
             state_dict = torch.load(path, map_location=torch.device("cpu"))["state_dict"]
         state_dict = {k.partition(prefix)[2]: v for k, v in state_dict.items() if k.startswith(prefix)}
-
         model.load_state_dict(state_dict)
         return model
 
     @staticmethod
     def _replace_model_name_prefix(
-            state_dict: dict,
-            old_prefix: str,
-            new_prefix: str,
+        state_dict: dict,
+        old_prefix: str,
+        new_prefix: str,
     ):
         start_idx = len(old_prefix)
         state_dict_processed = {
@@ -1185,11 +1555,7 @@ class AutoMMPredictor:
         }
         return state_dict_processed
 
-    def save(
-            self, 
-            path: str,
-            standalone: Optional[bool] = False
-    ):
+    def save(self, path: str, standalone: Optional[bool] = False):
         """
         Save this predictor to file in directory specified by `path`.
 
@@ -1198,33 +1564,17 @@ class AutoMMPredictor:
         path
             The directory to save this predictor.
         standalone
-            Whether to save the downloaded model for offline deployment. 
+            Whether to save the downloaded model for offline deployment.
             When standalone = True, save the transformers.CLIPModel and transformers.AutoModel to os.path.join(path,model_name),
-            and reset the associate model.model_name.checkpoint_name start with `local://` in config.yaml. 
+            and reset the associate model.model_name.checkpoint_name start with `local://` in config.yaml.
             When standalone = False, does not save the model, and requires online environment to download in load().
         """
 
         if standalone:
-            self._config = save_pretrained_models(
-                model=self._model,
-                config=self._config, 
-                path=path
-            )
+            self._config = save_pretrained_models(model=self._model, config=self._config, path=path)
 
         os.makedirs(path, exist_ok=True)
-        OmegaConf.save(
-            config=self._config,
-            f=os.path.join(path, 'config.yaml')
-        )
-        
-        if standalone:
-            model = create_and_save_model(
-                config=self._config,
-                num_classes=self._output_shape,
-                save_path=path,
-                num_numerical_columns=len(self._df_preprocessor.numerical_feature_names),
-                num_categories=self._df_preprocessor.categorical_num_categories
-            )
+        OmegaConf.save(config=self._config, f=os.path.join(path, "config.yaml"))
 
             for model_name in self._config.model.names:
                 if "hf_text" in model_name or model_name == "clip":
@@ -1262,15 +1612,76 @@ class AutoMMPredictor:
                 ensure_ascii=True,
             )
         # In case that users save to a path, which is not the original save_path.
-        if path != self._save_path:
-            shutil.copy(os.path.join(self._save_path, "model.ckpt"), path)
+        if os.path.abspath(path) != os.path.abspath(self._save_path):
+            model_path = os.path.join(self._save_path, "model.ckpt")
+            if os.path.isfile(model_path):
+                shutil.copy(model_path, path)
 
-    @classmethod
+    @staticmethod
+    def _load_metadata(
+        predictor: AutoMMPredictor,
+        path: str,
+        resume: Optional[bool] = False,
+        verbosity: Optional[int] = 3,
+    ):
+        path = os.path.expanduser(path)
+        assert os.path.isdir(path), f"'{path}' must be an existing directory."
+        config = OmegaConf.load(os.path.join(path, "config.yaml"))
+
+        config = convert_checkpoint_name(
+            config=config, path=path
+        )  # check the config for loading offline pretrained models
+
+        with open(os.path.join(path, "assets.json"), "r") as fp:
+            assets = json.load(fp)
+
+        with open(os.path.join(path, "df_preprocessor.pkl"), "rb") as fp:
+            df_preprocessor = pickle.load(fp)
+
+        try:
+            with open(os.path.join(path, "data_processors.pkl"), "rb") as fp:
+                data_processors = pickle.load(fp)
+            # Load text tokenizers after loading data processors.
+            if TEXT in data_processors:
+                data_processors[TEXT] = load_text_tokenizers(
+                    text_processors=data_processors[TEXT],
+                    path=path,
+                )
+            # backward compatibility. Add feature column names in each data processor.
+            data_processors = assign_feature_column_names(
+                data_processors=data_processors,
+                df_preprocessor=df_preprocessor,
+            )
+
+            # Only keep the modalities with non-empty processors.
+            data_processors = {k: v for k, v in data_processors.items() if len(v) > 0}
+        except:  # backward compatibility. reconstruct the data processor in case something went wrong.
+            data_processors = init_data_processors(
+                config=config,
+                df_preprocessor=df_preprocessor,
+            )
+
+        predictor._label_column = assets["label_column"]
+        predictor._problem_type = assets["problem_type"]
+        predictor._eval_metric_name = assets["eval_metric_name"]
+        predictor._verbosity = verbosity
+        predictor._resume = resume
+        predictor._save_path = path  # in case the original exp dir is copied to somewhere else
+        predictor._pretrain_path = path
+        predictor._config = config
+        predictor._output_shape = assets["output_shape"]
+        predictor._column_types = assets["column_types"]
+        predictor._validation_metric_name = assets["validation_metric_name"]
+        predictor._df_preprocessor = df_preprocessor
+        predictor._data_processors = data_processors
+
+        return predictor
+
+    @staticmethod
     def load(
-            cls,
-            path: str,
-            resume: Optional[bool] = False,
-            verbosity: Optional[int] = 3,
+        path: str,
+        resume: Optional[bool] = False,
+        verbosity: Optional[int] = 3,
     ):
         """
         Load a predictor object from a directory specified by `path`. The to-be-loaded predictor
@@ -1295,57 +1706,19 @@ class AutoMMPredictor:
         """
         path = os.path.expanduser(path)
         assert os.path.isdir(path), f"'{path}' must be an existing directory."
-        config = OmegaConf.load(os.path.join(path, "config.yaml"))
-
-        config = convert_checkpoint_name(config=config, path=path) # check the config for loading offline pretrained models
-
-        with open(os.path.join(path, "assets.json"), "r") as fp:
-            assets = json.load(fp)
-
-        with open(os.path.join(path, "df_preprocessor.pkl"), "rb") as fp:
-            df_preprocessor = pickle.load(fp)
-
-        try:
-            with open(os.path.join(path, "data_processors.pkl"), "rb") as fp:
-                data_processors = pickle.load(fp)
-            # Load text tokenizers after loading data processors.
-            if TEXT in data_processors:
-                data_processors[TEXT] = load_text_tokenizers(
-                    text_processors=data_processors[TEXT],
-                    path=path,
-                )
-        except:  # backward compatibility. reconstruct the data processor in case something went wrong.
-            data_processors = init_data_processors(
-                config=config,
-                num_categorical_columns=len(df_preprocessor.categorical_num_categories)
-            )
-
-        predictor = cls(
-            label=assets["label_column"],
-            problem_type=assets["problem_type"],
-            eval_metric=assets["eval_metric_name"],
-            verbosity=verbosity,
-        )
-        predictor._resume = resume
-        predictor._save_path = path  # in case the original exp dir is copied to somewhere else
-        predictor._pretrain_path = path
-        predictor._config = config
-        predictor._output_shape = assets["output_shape"]
-        predictor._column_types = assets["column_types"]
-        predictor._validation_metric_name = assets["validation_metric_name"]
-        predictor._df_preprocessor = df_preprocessor
-        predictor._data_processors = data_processors
+        predictor = AutoMMPredictor(label="dummy_label")
+        predictor = AutoMMPredictor._load_metadata(predictor=predictor, path=path, resume=resume, verbosity=verbosity)
 
         model = create_model(
-            config=config,
-            num_classes=assets["output_shape"],
-            num_numerical_columns=len(df_preprocessor.numerical_feature_names),
-            num_categories=df_preprocessor.categorical_num_categories,
+            config=predictor._config,
+            num_classes=predictor._output_shape,
+            num_numerical_columns=len(predictor._df_preprocessor.numerical_feature_names),
+            num_categories=predictor._df_preprocessor.categorical_num_categories,
             pretrained=False,  # set "pretrain=False" to prevent downloading online models
         )
 
-        resume_ckpt_path = os.path.join(path, "last.ckpt")
-        final_ckpt_path = os.path.join(path, "model.ckpt")
+        resume_ckpt_path = os.path.join(path, LAST_CHECKPOINT)
+        final_ckpt_path = os.path.join(path, MODEL_CHECKPOINT)
         if resume:  # resume training which crashed before
             if not os.path.isfile(resume_ckpt_path):
                 if os.path.isfile(final_ckpt_path):
@@ -1378,16 +1751,18 @@ class AutoMMPredictor:
                         f"Consider starting training from scratch."
                     )
             load_path = final_ckpt_path
-            logger.info(f"Load pretrained checkpoint: {os.path.join(path, 'model.ckpt')}")
+            logger.info(f"Load pretrained checkpoint: {os.path.join(path, MODEL_CHECKPOINT)}")
             ckpt_path = None  # must set None since we do not resume training
 
-        model = cls._load_state_dict(
+        model = AutoMMPredictor._load_state_dict(
             model=model,
             path=load_path,
         )
 
         predictor._ckpt_path = ckpt_path
         predictor._model = model
+        if not resume:
+            predictor._continuous_training = True
 
         return predictor
 
@@ -1407,7 +1782,7 @@ class AutoMMPredictor:
         if self._problem_type == MULTICLASS or self._problem_type == BINARY:
             return self._df_preprocessor.label_generator.classes_
         else:
-            warnings.warn('Accessing class names for a non-classification problem. Return None.')
+            warnings.warn("Accessing class names for a non-classification problem. Return None.")
             return None
 
     @property
@@ -1431,7 +1806,8 @@ class AutoMMPredictor:
                 f"Warning: Attempted to retrieve positive class label in a non-binary problem. "
                 f"Positive class labels only exist in binary classification. "
                 f"Returning None instead. self.problem_type is '{self.problem_type}'"
-                f" but positive_class only exists for '{BINARY}'.")
+                f" but positive_class only exists for '{BINARY}'."
+            )
             return None
         else:
             return self.class_labels[1]

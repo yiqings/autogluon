@@ -25,23 +25,36 @@ install_requires = [
     'Pillow',
     'tqdm',
     'boto3',
-    'timm',
+    'setuptools<=59.5.0',
+    'timm<0.6.0',
+    'torch>=1.0,<1.11',
     'fairscale>=0.4.5,<0.5.0',
     'scikit-image>=0.19.1,<0.20.0',
     'smart_open>=5.2.1,<5.3.0',
-    'pytorch_lightning>=1.5.10,<1.6.0',
+    'pytorch_lightning>=1.5.10,<1.7.0',
     'torchmetrics>=0.7.2,<0.8.0',
     'transformers>=4.16.2,<4.17.0',
     'nptyping>=1.4.4,<1.5.0',
     'omegaconf>=2.1.1,<2.2.0',
     'sentencepiece>=0.1.95,<0.2.0',
+    'protobuf<=3.18.1',  # https://github.com/awslabs/autogluon/issues/1762
     f'autogluon.core=={version}',
     f'autogluon.features=={version}',
     f'autogluon.common=={version}',
     'autogluon-contrib-nlp==0.0.1b20220208',
+    'pytorch-metric-learning>=1.3.0,<1.4.0',
+    'nlpaug>=1.1.10,<2.0.0',
+    'nltk>=3.4.5,<4.0.0',
 ]
 
 install_requires = ag.get_dependency_version_ranges(install_requires)
+
+extras_require = {
+    'tests': [
+            'black~=22.0,>=22.3',
+        ]
+}
+
 
 if __name__ == '__main__':
     ag.create_version_file(version=version, submodule=submodule)
@@ -51,8 +64,11 @@ if __name__ == '__main__':
         'configs/model/*.yaml',
         'configs/optimization/*.yaml',
         'configs/environment/*.yaml',
+        'configs/distiller/*.yaml',
+        'configs/matcher/*.yaml',
     ]
     setup(
         install_requires=install_requires,
+        extras_require=extras_require,
         **setup_args,
     )
