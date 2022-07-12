@@ -107,11 +107,13 @@ We can reproduce the following results by tuning `--embedding_arch` in `example_
 Datasets | ca | ad | he | ja | hi | al | ep | ye | co | ya | mi | Results
 ----  | ----  | ----  | ----  | ----  | ----  | ----  | ----  | ----  | ----  | ----  | ----  | ----
 metrics | rmse | acc | acc | acc | acc | acc | acc | rmse | acc | rmse | rmse
-["linear" ] | 0.482 | 0.859 | 0.379 | 0.721 | 0.726 | 0.949 | RuntimeError | 8.891 | 0.963 | 0.769 | 0.761 | [link](https://autogluon.s3.us-west-2.amazonaws.com/results/tabular/tabular_example_result.zip)
+["linear"] | 0.482 | 0.859 | 0.379 | 0.721 | 0.726 | 0.949 | RuntimeError | 8.891 | 0.963 | 0.769 | 0.761 | [link](https://autogluon.s3.us-west-2.amazonaws.com/results/tabular/tabular_example_result.zip)
 ["linear", "relu"] | 0.477 | 0.859 | 0.370 | 0.721 | 0.726 | 0.951 | RuntimeError | 8.953 | 0.967 | 0.772 | 0.757 | [link](https://autogluon.s3.us-west-2.amazonaws.com/results/tabular/tabular_example_result2.zip)
 ["linear", "leaky_relu"] | 0.473 | 0.858 | 0.370 | 0.722 | 0.725 | 0.947 | RuntimeError | 8.915 | 0.965 | 0.771 | 0.776 | [link](https://autogluon.s3.us-west-2.amazonaws.com/results/tabular/tabular_example_result3.zip)
 ["linear", "relu", "linear"] | 0.468 | 0.858 | 0.374 | 0.721 | 0.723 | 0.951 | RuntimeError | 8.941 | 0.965 | 0.769\* | 0.770 | [link](https://autogluon.s3.us-west-2.amazonaws.com/results/tabular/tabular_example_result4.zip)
 ["positional", "linear"] | 0.467 | 0.864 | 0.347 | 0.694 | 0.709 | 0.951 | RuntimeError | 9.120 | 0.967 | 0.773\* | 0.761 | [link](https://autogluon.s3.us-west-2.amazonaws.com/results/tabular/tabular_example_result5.zip)
+["positional", "linear", "relu"] | 0.465 | 0.866 | 0.343 | 0.688 | 0.704 | 0.947 | RuntimeError | 9.131 | 0.967 | 0.774\* | 0.760 | [link]()
+["positional"] | 0.480 | 0.861 | 0.334 | 0.684 | 0.696 | 0.951 | RuntimeError | 9.189 | 0.967 | 0.774 | 0.765 | [link]()
 
 \* denotes adjusting `env.per_gpu_batch_size` from `128` to `64` to support runing a larger model on our device.
 
